@@ -1,0 +1,207 @@
+import * as THREE from 'three';
+import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
+
+// 1. SCÈNE, BROUILLARD SAN ANDREAS ET CAMÉRA
+const scene = new THREE.Scene();
+const fogColor = 0xd59b58; // Ambiance chaleur / smog orangé
+scene.fog = new THREE.FogExp2(fogColor, 0.035);
+scene.background = new THREE.Color(fogColor);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 80);
+camera.position.set(0, 1.7, 5);
+
+// 2. RENDU BASSE RÉSOLUTION PS2 (Pixels nets sur les polygones)
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+// On divise la résolution par 2.5 pour émuler le 480p
+const retroScale = 0.4;
+renderer.setSize(window.innerWidth * retroScale, window.innerHeight * retroScale, false);
+renderer.domElement.style.width = '100vw';
+renderer.domElement.style.height = '100vh';
+renderer.domElement.style.imageRendering = 'pixelated'; // Étirement sans flou
+document.body.appendChild(renderer.domElement);
+document.body.style.margin = '0';
+document.body.style.overflow = 'hidden';
+
+// 3. CHARGEMENT DES TEXTURES
+const textureLoader = new THREE.TextureLoader();
+function loadRetroTex(url, repeatX = 1, repeatY = 1) {
+  const tex = textureLoader.load(url);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(repeatX, repeatY);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+const roadTex = loadRetroTex('sol.png', 2, 10);
+const facadeTex = loadRetroTex('facade1.png', 1, 1);
+const shopTex = loadRetroTex('facade2.png', 1, 1);
+
+// Matériau avec teinte légèrement cuite
+const roadMat = new THREE.MeshLambertMaterial({ map: roadTex });
+const wallMat = new THREE.MeshLambertMaterial({ map: facadeTex });
+const shopMat = new THREE.MeshLambertMaterial({ map: shopTex });
+const curbMat = new THREE.MeshLambertMaterial({ color: 0x777772 });
+
+// 4. GÉOMÉTRIE DU SOL EN RELIEF (Chaussée + Trottoirs surélevés)
+const streetLength = 60;
+const roadWidth = 5;
+const sidewalkWidth = 2.2;
+const curbHeight = 0.18; // Marche de 18 cm
+
+// Chaussée
+const roadGeo = new THREE.PlaneGeometry(roadWidth, streetLength);
+const road = new THREE.Mesh(roadGeo, roadMat);
+road.rotation.x = -Math.PI / 2;
+scene.add(road);
+
+// Fonction de génération des trottoirs surélevés
+function createSidewalk(xPos) {
+  const geo = new THREE.BoxGeometry(sidewalkWidth, curbHeight, streetLength);
+  const mesh = new THREE.Mesh(geo, curbMat);
+  mesh.position.set(xPos, curbHeight / 2, -streetLength / 2 + 10);
+  scene.add(mesh);
+}
+createSidewalk(-(roadWidth / 2 + sidewalkWidth / 2)); // Trottoir gauche
+createSidewalk((roadWidth / 2 + sidewalkWidth / 2));  // Trottoir droit
+
+// 5. IMMEUBLES AVEC DÉCROCHÉS ARCHITECTURAUX
+const blockLength = 8;
+const numBlocks = 6;
+
+function createBuildingBlock(side, index) {
+  const group = new THREE.Group();
+  const xDir = side === 'left' ? -1 : 1;
+  const baseX = xDir * (roadWidth / 2 + sidewalkWidth);
+  const zPos = -index * blockLength;
+
+  // Rez-de-chaussée (Boutique avancée)
+  const groundGeo = new THREE.BoxGeometry(4, 3.5, blockLength);
+  const groundMesh = new THREE.Mesh(groundGeo, shopMat);
+  groundMesh.position.set(baseX + xDir * 2, 3.5 / 2, zPos);
+  group.add(groundMesh);
+
+  // Étages supérieurs (Légèrement en retrait de 50 cm)
+  const upperGeo = new THREE.BoxGeometry(4, 7.5, blockLength);
+  const upperMesh = new THREE.Mesh(upperGeo, wallMat);
+  upperMesh.position.set(baseX + xDir * 2.5, 3.5 + 7.5 / 2, zPos);
+  group.add(upperMesh);
+
+  // Corniche en surplomb au sommet du toit
+  const corniceGeo = new THREE.BoxGeometry(0.5, 0.4, blockLength);
+  const corniceMat = new THREE.MeshLambertMaterial({ color: 0x4a453f });
+  const cornice = new THREE.Mesh(corniceGeo, corniceMat);
+  cornice.position.set(baseX + xDir * 0.3, 11 + 0.2, zPos);
+  group.add(cornice);
+
+  scene.add(group);
+}
+
+for (let i = 0; i < numBlocks; i++) {
+  createBuildingBlock('left', i);
+  createBuildingBlock('right', i);
+}
+
+// 6. MOBILIER URBAIN : LAMPADAIRES ET FAUX CÔNES VOLUMÉTRIQUES
+function createStreetLight(x, z, rotateY) {
+  const poleGroup = new THREE.Group();
+  
+  // Mât métallique
+  const poleGeo = new THREE.CylinderGeometry(0.06, 0.08, 4, 6);
+  const poleMat = new THREE.MeshLambertMaterial({ color: 0x222222 });
+  const pole = new THREE.Mesh(poleGeo, poleMat);
+  pole.position.y = 2;
+  poleGroup.add(pole);
+
+  // Tête du lampadaire
+  const headGeo = new THREE.BoxGeometry(0.3, 0.2, 0.5);
+  const head = new THREE.Mesh(headGeo, poleMat);
+  head.position.set(0, 4, 0.2);
+  poleGroup.add(head);
+
+  // Faux cône de lumière volumétrique (Pure signature PS2)
+  const coneGeo = new THREE.ConeGeometry(1.6, 3.8, 8, 1, true);
+  const coneMat = new THREE.MeshBasicMaterial({
+    color: 0xffd97d,
+    transparent: true,
+    opacity: 0.18,
+    side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  const lightCone = new THREE.Mesh(coneGeo, coneMat);
+  lightCone.position.set(0, 2, 0.2);
+  poleGroup.add(lightCone);
+
+  poleGroup.position.set(x, curbHeight, z);
+  poleGroup.rotation.y = rotateY;
+  scene.add(poleGroup);
+}
+
+createStreetLight(-(roadWidth / 2 + 0.3), -8, 0);
+createStreetLight((roadWidth / 2 + 0.3), -18, Math.PI);
+createStreetLight(-(roadWidth / 2 + 0.3), -28, 0);
+
+// 7. LUMIÈRES DE LA SCÈNE
+const ambient = new THREE.AmbientLight(0xd5b085, 0.85); // Teinte ambrée
+scene.add(ambient);
+
+const sunLight = new THREE.DirectionalLight(0xfff0d0, 1.2);
+sunLight.position.set(10, 20, 10);
+scene.add(sunLight);
+
+// 8. TABLEAU EN ACCROCHAGE URBAIN (Contraste HD préservé)
+const paintingTex = textureLoader.load('tableau1.png');
+paintingTex.colorSpace = THREE.SRGBColorSpace;
+const paintingMat = new THREE.MeshBasicMaterial({ map: paintingTex });
+const painting = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 1.3), paintingMat);
+// Accroché sur la vitrine du premier immeuble à gauche
+painting.position.set(-(roadWidth / 2 + 0.05), 1.7, -4);
+painting.rotation.y = Math.PI / 2;
+scene.add(painting);
+
+// 9. DÉPLACEMENT CLAVIER / SOURIS
+const controls = new PointerLockControls(camera, document.body);
+document.addEventListener('click', () => controls.lock());
+
+const keys = { KeyW: false, KeyA: false, KeyS: false, KeyD: false };
+document.addEventListener('keydown', (e) => keys[e.code] = true);
+document.addEventListener('keyup', (e) => keys[e.code] = false);
+
+const velocity = new THREE.Vector3();
+const direction = new THREE.Vector3();
+let prevTime = performance.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const time = performance.now();
+
+  if (controls.isLocked) {
+    const delta = (time - prevTime) / 1000;
+    velocity.x -= velocity.x * 10.0 * delta;
+    velocity.z -= velocity.z * 10.0 * delta;
+
+    direction.z = Number(keys.KeyS) - Number(keys.KeyW);
+    direction.x = Number(keys.KeyD) - Number(keys.KeyA);
+    direction.normalize();
+
+    const speed = 25.0;
+    if (keys.KeyW || keys.KeyS) velocity.z -= direction.z * speed * delta;
+    if (keys.KeyA || keys.KeyD) velocity.x -= direction.x * speed * delta;
+
+    controls.moveRight(-velocity.x * delta);
+    controls.moveForward(-velocity.z * delta);
+  }
+
+  prevTime = time;
+  renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth * retroScale, window.innerHeight * retroScale, false);
+});
+
+animate();
