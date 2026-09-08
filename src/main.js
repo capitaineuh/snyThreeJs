@@ -708,6 +708,20 @@ function titleFromSrc(src) {
   return src.split('/').pop().replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ');
 }
 
+// Fiche de l'oeuvre sur Artsy. Le slug est déduit du titre : minuscules, accents
+// retirés, tout le reste en tirets. « Sofia » -> seny-sofia.
+// Si un slug Artsy ne suit pas cette règle, poser `url: '...'` sur la ligne de
+// l'oeuvre dans ARTWORKS prend le dessus.
+function artsyUrl(title) {
+  const slug = title
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return 'https://www.artsy.net/artwork/seny-' + slug;
+}
+
 function loadArtTexture(src) {
   const tex = loader.load(src, undefined, undefined, () => {
     console.error('[galerie] toile introuvable : ' + src);
@@ -765,7 +779,8 @@ function hangArtwork(art) {
     [canvasEdgeMat, canvasEdgeMat, canvasEdgeMat, canvasEdgeMat, artMat, canvasEdgeMat]
   );
   canvas.position.z = GALLERY.panelDepth + 0.002 + GALLERY.canvasDepth / 2;
-  canvas.userData = { src: art.src, title: art.title ?? titleFromSrc(art.src), size: art.size };
+  const title = art.title ?? titleFromSrc(art.src);
+  canvas.userData = { src: art.src, title, size: art.size, url: art.url ?? artsyUrl(title) };
   mount.add(canvas);
   ARTWORK_MESHES.push(canvas);
 
@@ -1150,6 +1165,17 @@ const VIEWER_CSS = `
                box-shadow: 0 30px 90px rgba(0,0,0,.8); will-change: transform; }
 .viewer__cap { margin-top: 18px; text-align: center; font: 13px monospace;
                letter-spacing: .3em; text-transform: uppercase; color: #d59b58; }
+/* Le titre est un lien vers la fiche Artsy. Toute la zone est cliquable, titre
+   et mention comprises : au doigt, une cible d'une seule ligne serait trop fine. */
+.viewer__link { display: inline-block; color: inherit; text-decoration: none;
+                padding: 4px 6px 2px; }
+.viewer__link b { display: block; font-weight: normal; padding-bottom: 6px;
+                  border-bottom: 1px solid rgba(213,155,88,.45); }
+.viewer__link small { display: block; margin-top: 8px; font-size: 9px;
+                      letter-spacing: .22em; opacity: .5; }
+.viewer__link:hover b { border-bottom-color: #d59b58; }
+.viewer__link:hover small { opacity: .85; }
+.viewer__link:active small { opacity: .85; }
 .viewer__close { position: absolute; z-index: 1;
                  top: max(22px, env(safe-area-inset-top, 0px));
                  right: max(22px, env(safe-area-inset-right, 0px));
@@ -1191,13 +1217,19 @@ viewer.innerHTML =
   '<div class="viewer__backdrop"></div>' +
   '<figure class="viewer__fig">' +
   '<img class="viewer__img" alt="">' +
-  '<figcaption class="viewer__cap"></figcaption>' +
+  '<figcaption class="viewer__cap">' +
+  '<a class="viewer__link" target="_blank" rel="noopener noreferrer">' +
+  '<b></b><small>VOIR SUR ARTSY &#8599;</small>' +
+  '</a>' +
+  '</figcaption>' +
   '</figure>' +
   '<button class="viewer__close" type="button">FERMER [ ECHAP ]</button>';
 document.body.appendChild(viewer);
 const backdrop = viewer.querySelector('.viewer__backdrop');
 const viewerImg = viewer.querySelector('.viewer__img');
 const viewerCap = viewer.querySelector('.viewer__cap');
+const viewerLink = viewer.querySelector('.viewer__link');
+const viewerLinkTitle = viewerLink.querySelector('b');
 const closeBtn = viewer.querySelector('.viewer__close');
 
 const raycaster = new THREE.Raycaster();
@@ -1276,12 +1308,20 @@ async function openViewer(mesh) {
 
   try {
     const from = screenRect(mesh);
-    viewerCap.textContent = mesh.userData.title;
+    viewerLinkTitle.textContent = mesh.userData.title;
+    viewerLink.href = mesh.userData.url;
     viewerImg.src = mesh.userData.src;
 
     // On rend la souris pour pouvoir cliquer dans la visionneuse. Les touches
     // encore enfoncées sont remises à zéro, sinon on repart en glissade au retour.
-    controls.unlock();
+    //
+    // Le test sur isLocked n'est PAS une optimisation. PointerLockControls.unlock()
+    // appelle document.exitPointerLock() sans aucune garde, or l'API Pointer Lock
+    // n'existe pas sur la plupart des navigateurs mobiles : sur iPhone la méthode
+    // est undefined et l'appel jette. L'exception partait dans le catch plus bas,
+    // qui refermait tout — d'où une visionneuse qui ne s'ouvrait jamais au doigt,
+    // ni à la tape ni au bouton, sans le moindre signe à l'écran.
+    if (controls.isLocked) controls.unlock();
     hideTouchUI();
     for (const code of Object.keys(keys)) keys[code] = false;
     velocity.set(0, 0, 0);
