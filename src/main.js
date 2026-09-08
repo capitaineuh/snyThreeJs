@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import gsap from 'gsap';
 
 // ============================================================================
@@ -29,6 +30,16 @@ const LOOK = {
   fogDensity: 0.025,    // 0.035 auparavant : à 20 m tout disparaissait, on ne voyait plus les textures
   retroHeight: 432,     // hauteur de rendu interne (~480p) quelle que soit la taille de l'écran
   groundAnisotropy: 4,  // mettre 1 pour un rendu strictement PS2 (sol franchement flou au loin)
+};
+
+// Ciel. La couleur d'horizon n'est pas réécrite en dur : elle référence
+// LOOK.fogColor, seule façon de garantir que la jonction sol/ciel reste
+// invisible même si vous retouchez l'ambiance de la rue.
+const SKY = {
+  radius: 70,        // doit rester sous le plan lointain (90), sinon le dôme est tranché
+  zenith: 0x3a4f66,  // bleu-gris crépusculaire ; 0x2c3e50 pour une nuit plus avancée
+  horizon: LOOK.fogColor,
+  exponent: 1.3,     // > 1 étire la bande chaude vers le haut ; < 1 assombrit plus vite
 };
 
 const EYE_HEIGHT = 1.7;
@@ -110,6 +121,23 @@ const GALLERY = {
 // une oeuvre devant soi, jamais deux en vis-à-vis.
 // Le titre affiché dans la visionneuse est déduit du nom de fichier ; ajouter un
 // champ `title: '...'` sur une ligne pour lui donner un vrai nom à la place.
+//
+// La sculpture, elle, est posée sur la corniche du rez-de-chaussée : les étages
+// étant en retrait de BLOCK.setback, le toit des vitrines laisse un rebord de
+// 50 cm à 3,50 m de haut, sur toute la longueur de la rue.
+const SCULPTURE = {
+  src: '/assets/sculpture_web.glb',
+  height: 1.25,     // hauteur voulue en mètres — un personnage accroupi
+  side: 'left',
+  z: -9,            // au-dessus de la porte de garage du bloc 2
+  // Relevés dans le maillage lui-même : le personnage est accroupi, et le point
+  // le plus bas de sa moitié arrière forme un plat net à 0,32 de sa hauteur —
+  // c'est l'assise. Devant, ça retombe à 0 : les pieds. La bascule est pile au
+  // Z d'origine du modèle, qu'on fait donc coïncider avec le bord de la corniche.
+  // Exprimé en fraction de la hauteur, pour rester valable si `height` change.
+  seatHeight: 0.32,
+  sink: 0.015,      // enfoncement dans la corniche : évite deux surfaces coplanaires
+};
 const ARTWORKS = [
   { src: '/assets/tableau/Sofia.png', size: 1.5, side: 'left',  z: -2 },    // bleu roi, très contrasté : la première chose qu'on voit
   { src: '/assets/tableau/Toumani.png', size: 1.4, side: 'right', z: -5.5 },  // ocre sourd : placé près, sinon le brouillard le mange
@@ -124,7 +152,67 @@ const ARTWORKS = [
 // ============================================================================
 const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(LOOK.fogColor, LOOK.fogDensity);
+// Le dôme couvre désormais tout le champ : ce fond n'est plus qu'un filet de
+// sécurité, pour qu'un dôme mal réglé ne laisse pas du noir.
 scene.background = new THREE.Color(LOOK.fogColor);
+
+// --- Dôme de ciel ---
+// Une sphère retournée, recentrée sur la caméra à chaque image, dégradée du
+// brouillard à l'horizon vers un bleu-gris au zénith.
+//
+// Deux points méritent l'attention :
+//
+// 1. `#include <colorspace_fragment>`. THREE.Color range ses composantes en
+//    linéaire et les matériaux natifs les reconvertissent en sRGB en fin de
+//    shader ; un ShaderMaterial écrit à la main, non. Sans cette ligne l'horizon
+//    sortirait en RGB(170, 84, 25) au lieu de RGB(213, 155, 88) — bien plus
+//    sombre que le brouillard, et la jointure sauterait aux yeux. La fonction
+//    linearToOutputTexel, elle, est fournie d'office par le préfixe de three.js.
+//
+// 2. Le dégradé suit l'axe Y LOCAL du dôme, pas le Y monde. Le dôme étant collé
+//    à la caméra, son équateur est toujours à hauteur d'oeil : c'est la
+//    définition même de l'horizon. Avec le Y monde, la ligne d'horizon
+//    glisserait à chaque saut et à chaque montée sur le trottoir.
+const skyMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(SKY.radius, 32, 16),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false, // le brouillard n'a pas à teinter le ciel : l'horizon EST sa couleur
+    uniforms: {
+      uZenith: { value: new THREE.Color(SKY.zenith) },
+      uHorizon: { value: new THREE.Color(SKY.horizon) },
+      uExponent: { value: SKY.exponent },
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vLocal;
+      void main() {
+        vLocal = position;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uZenith;
+      uniform vec3 uHorizon;
+      uniform float uExponent;
+      varying vec3 vLocal;
+
+      void main() {
+        // -1 au nadir, 0 à l'horizon, +1 au zénith. La normalisation est faite
+        // par fragment : interpoler un vecteur déjà normalisé le dénormaliserait
+        // entre deux sommets, et le dégradé se briserait sur les arêtes.
+        float h = normalize(vLocal).y;
+        float t = pow(clamp(h, 0.0, 1.0), uExponent);
+        gl_FragColor = vec4(mix(uHorizon, uZenith, t), 1.0);
+        #include <colorspace_fragment>
+      }
+    `,
+  })
+);
+// Dessiné en premier, sans écrire dans le tampon de profondeur : il tient lieu
+// de fond et tout le reste se peint par-dessus sans qu'il n'occulte jamais rien.
+skyMesh.renderOrder = -1;
+scene.add(skyMesh);
 
 const camera = new THREE.PerspectiveCamera(VIEW.fov, window.innerWidth / window.innerHeight, 0.1, 90);
 camera.position.set(0, EYE_HEIGHT, 5);
@@ -532,6 +620,47 @@ function addArtLight(mount, size) {
 
 ARTWORKS.forEach((art) => hangArtwork(art));
 
+// --- La sculpture sur sa corniche ---
+// Le GLB sort de Blender déjà normalisé — 1 unité de haut, base exactement à
+// Y = 0 — mais on ne s'appuie pas là-dessus : tout est recalculé depuis la boîte
+// englobante réelle, pour que le placement reste juste si vous réexportez le
+// modèle à une autre échelle ou avec un autre centrage.
+function placeSculpture(root) {
+  const raw = new THREE.Box3().setFromObject(root).getSize(new THREE.Vector3());
+  if (raw.y === 0) {
+    console.error('[sculpture] modèle vide ou sans géométrie');
+    return;
+  }
+  root.scale.setScalar(SCULPTURE.height / raw.y);
+
+  // Le personnage regarde son axe +Z local : le boîtier, l'objectif et les verres
+  // fumés sont tous du côté +Z du modèle. On le tourne vers la rue, avec la même
+  // convention que les toiles.
+  const xDir = SCULPTURE.side === 'left' ? -1 : 1;
+  root.rotation.y = xDir === -1 ? Math.PI / 2 : -Math.PI / 2;
+
+  // Boîte relue APRÈS mise à l'échelle et rotation, pour ne rien supposer du
+  // centrage du modèle.
+  const box = new THREE.Box3().setFromObject(root);
+  const seatY = box.min.y + SCULPTURE.seatHeight * (box.max.y - box.min.y);
+
+  root.position.set(
+    // Le bord de la corniche tombe sur le Z d'origine du modèle : les fesses
+    // restent posées dessus, les jambes passent dans le vide.
+    xDir * FACADE_X,
+    BLOCK.groundHeight - SCULPTURE.sink - seatY, // l'assise affleure la corniche
+    SCULPTURE.z - (box.min.z + box.max.z) / 2    // centré sur le z demandé
+  );
+  scene.add(root);
+}
+
+new GLTFLoader(manager).load(
+  SCULPTURE.src,
+  (gltf) => placeSculpture(gltf.scene),
+  undefined,
+  () => console.error('[sculpture] échec de chargement : ' + SCULPTURE.src)
+);
+
 // ============================================================================
 // 10. LUMIÈRES
 // ============================================================================
@@ -779,6 +908,10 @@ function animate() {
     updateVertical(delta);
     if (!TOUCH_MODE) updateAim();
   }
+
+  // Recentré à chaque image, y compris en pause : le joueur ne peut ni sortir du
+  // dôme ni s'en approcher, et l'horizon reste exactement à hauteur d'oeil.
+  skyMesh.position.copy(camera.position);
 
   renderer.render(scene, camera);
 }
