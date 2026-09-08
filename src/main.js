@@ -76,7 +76,7 @@ const TOUCH = {
   // centaine de degrés ; à 0,0032 il fallait s'y reprendre à deux fois.
   lookSpeed: 0.0045,
   deadZone: 0.12,     // sous ce seuil le joystick est considéré au repos
-  tapSlop: 12,        // px : au-delà, le doigt regardait autour, ce n'est pas une tape
+  tapSlop: 16,        // px de dérive : au-delà, le doigt balayait, ce n'est pas une tape
   hintDelay: 5,       // s d'affichage de l'aide au premier passage
 };
 
@@ -97,6 +97,7 @@ const TEX = {
   sidewalk: '/assets/sol_trotoire.jpg',
   facade: '/assets/facade.jpg',
   garage: '/assets/porte_garage.jpg',
+  shop: '/assets/lyca.png',
 };
 
 // Réglages d'accrochage communs à toutes les oeuvres.
@@ -448,6 +449,61 @@ for (let i = 0; i < BLOCK.count; i++) {
   createBuildingBlock('right', i);
 }
 
+// ============================================================================
+//    L'ÉPICERIE
+//    L'image est une élévation frontale complète, sa marge de mur en brique
+//    comprise. On la plaque donc sur TOUTE la hauteur du rez-de-chaussée, du
+//    trottoir jusqu'à la corniche : cadrée plus petit, cette brique ferait une
+//    rustine collée sur le crépi. Sa largeur découle du rapport de l'image, pour
+//    qu'aucune lettre de l'enseigne ne soit étirée.
+//    Elle est centrée sur la jonction de deux blocs — c'est là que les façades
+//    changent de teinte et de décalage UV. Le commerce vient donc masquer la
+//    couture en même temps qu'il s'installe entre les deux immeubles.
+// ============================================================================
+const SHOP = {
+  side: 'right',
+  z: -12.5,     // couture entre les blocs 2 et 3
+  offset: 0.03, // plaquée comme les portes de garage
+  glow: 0.35,   // intensité de l'éclairage intérieur (voir plus bas)
+};
+
+function createShopFront(tex) {
+  const height = BLOCK.groundHeight - STREET.curbHeight; // 3,32 m, trottoir -> corniche
+  const width = height * (tex.image.width / tex.image.height);
+  const xDir = SHOP.side === 'left' ? -1 : 1;
+
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(width, height),
+    new THREE.MeshLambertMaterial({
+      map: tex,
+      // La façade de droite tourne le dos au soleil : elle ne reçoit que
+      // l'ambiante, et le commerce s'y enfoncerait dans la pénombre. L'emissiveMap
+      // rallume chaque pixel proportionnellement à sa propre couleur — l'enseigne
+      // bleue s'illumine, la brique reste sombre. C'est le comportement d'une
+      // vitrine éclairée de l'intérieur, pas un rattrapage arbitraire.
+      emissiveMap: tex,
+      emissive: 0xffffff,
+      emissiveIntensity: SHOP.glow,
+    })
+  );
+  mesh.position.set(xDir * (FACADE_X - SHOP.offset), STREET.curbHeight + height / 2, SHOP.z);
+  // Un PlaneGeometry regarde +Z ; même convention que les portes de garage.
+  mesh.rotation.y = xDir === -1 ? Math.PI / 2 : -Math.PI / 2;
+  scene.add(mesh);
+}
+
+// Chargée à part des autres textures : on a besoin des dimensions de l'image
+// pour en déduire la largeur du commerce.
+loader.load(
+  TEX.shop,
+  (tex) => {
+    setupTex(tex, { wrap: THREE.ClampToEdgeWrapping, aniso: LOOK.groundAnisotropy });
+    createShopFront(tex);
+  },
+  undefined,
+  () => console.error('[épicerie] échec de chargement : ' + TEX.shop)
+);
+
 // Immeubles de fond qui ferment la rue aux deux bouts : sans eux on voit le vide
 // dès qu'on se retourne.
 function createEndWall(z, towardPositiveZ) {
@@ -479,9 +535,11 @@ const coneMat = new THREE.MeshBasicMaterial({
   depthWrite: false,
 });
 
-// Les mâts sont les seuls obstacles au milieu de la rue : on les enregistre pour
-// que le joueur les contourne au lieu de les traverser (section 12).
+// Colliders en plan, lus par resolveCollisions (section 12) : cercles pour ce
+// qu'on contourne en glissant (mâts, bacs), rectangles pour ce qu'on longe
+// (barrières).
 const OBSTACLES = [];
+const BLOCKERS = [];
 
 function createStreetLight(x, z, rotateY) {
   const group = new THREE.Group();
@@ -511,6 +569,121 @@ for (let i = 0; i < BLOCK.count; i += 2) {
   const onLeft = (i / 2) % 2 === 0;
   createStreetLight(onLeft ? -(ROAD_HALF + 0.3) : ROAD_HALF + 0.3, blockZ(i), onLeft ? 0 : Math.PI);
 }
+
+// ============================================================================
+//    OBSTACLES : POUBELLES ET BARRIÈRES
+//    Ils sont là pour casser la ligne droite. La chaussée fait 5 m de large et
+//    rien n'y traînait : on la traversait sans jamais tourner le volant.
+//    Les bacs prennent un collider circulaire — on glisse autour — et les
+//    barrières une emprise rectangulaire, qu'on longe.
+//    Attention : les collisions sont en plan (XZ) et ignorent la hauteur. On ne
+//    saute donc pas par-dessus une barrière, ce qui est de toute façon le cas
+//    dans la réalité avec 1,10 m de haut.
+// ============================================================================
+const binBodyMat = new THREE.MeshLambertMaterial({ color: 0x36413a });
+const binBaseMat = new THREE.MeshLambertMaterial({ color: 0x1b1f1c });
+const LID_MATS = {
+  vert: new THREE.MeshLambertMaterial({ color: 0x2f6b3a }),
+  jaune: new THREE.MeshLambertMaterial({ color: 0xc8a51e }),
+  blanc: new THREE.MeshLambertMaterial({ color: 0x9fa39c }),
+};
+const barrierMat = new THREE.MeshLambertMaterial({ color: 0x8e928c });
+
+const BIN = { width: 0.72, height: 1.02, depth: 0.6, radius: 0.45 };
+
+// Bac roulant, façon collecte parisienne : cuve sombre, couvercle coloré selon
+// le flux. Posé sur le sol réel du point (trottoir ou chaussée).
+function createBin(x, z, rotY, flux) {
+  const group = new THREE.Group();
+
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(BIN.width, BIN.height, BIN.depth),
+    binBodyMat
+  );
+  body.position.y = BIN.height / 2 + 0.1;
+  group.add(body);
+
+  // Socle sombre à la place des roues : à 480p on ne verrait pas des roues, mais
+  // l'ombre sous la cuve, elle, se lit.
+  const base = new THREE.Mesh(
+    new THREE.BoxGeometry(BIN.width - 0.1, 0.1, BIN.depth - 0.08),
+    binBaseMat
+  );
+  base.position.y = 0.05;
+  group.add(base);
+
+  const lid = new THREE.Mesh(
+    new THREE.BoxGeometry(BIN.width + 0.04, 0.09, BIN.depth + 0.04),
+    LID_MATS[flux]
+  );
+  lid.position.y = BIN.height + 0.14;
+  group.add(lid);
+
+  group.position.set(x, groundHeight(x), z);
+  group.rotation.y = rotY;
+  scene.add(group);
+
+  OBSTACLES.push({ x, z, radius: BIN.radius });
+}
+
+// Barrière Vauban, toujours en travers de la rue : gardée alignée sur les axes,
+// pour que son emprise rectangulaire colle vraiment à ce qu'on voit. Une
+// barrière en biais aurait un collider plus gros qu'elle, et on buterait dans le
+// vide.
+const BARRIER = { height: 1.06, depth: 0.44, bars: 8 };
+
+function createBarrier(x, z, length) {
+  const group = new THREE.Group();
+  const add = (geo, px, py, pz) => {
+    const m = new THREE.Mesh(geo, barrierMat);
+    m.position.set(px, py, pz);
+    group.add(m);
+  };
+
+  const railGeo = new THREE.BoxGeometry(length, 0.05, 0.04);
+  add(railGeo, 0, BARRIER.height, 0);
+  add(railGeo, 0, BARRIER.height - 0.42, 0);
+
+  const barGeo = new THREE.BoxGeometry(0.025, BARRIER.height - 0.06, 0.025);
+  for (let i = 0; i < BARRIER.bars; i++) {
+    const t = (i + 0.5) / BARRIER.bars - 0.5;
+    add(barGeo, t * (length - 0.12), (BARRIER.height - 0.06) / 2 + 0.03, 0);
+  }
+
+  // Pieds en U : deux montants et une traverse au sol de chaque côté.
+  const legGeo = new THREE.BoxGeometry(0.05, BARRIER.height, 0.05);
+  const footGeo = new THREE.BoxGeometry(0.05, 0.04, BARRIER.depth);
+  for (const s of [-1, 1]) {
+    add(legGeo, (s * length) / 2, BARRIER.height / 2, 0);
+    add(footGeo, (s * length) / 2, 0.02, 0);
+  }
+
+  group.position.set(x, groundHeight(x), z);
+  scene.add(group);
+
+  BLOCKERS.push({
+    minX: x - length / 2,
+    maxX: x + length / 2,
+    minZ: z - BARRIER.depth / 2,
+    maxZ: z + BARRIER.depth / 2,
+  });
+}
+
+// L'implantation. Un bac isolé se contourne d'un pas ; ce qui fait vraiment
+// dévier, c'est la barrière qui mange la moitié de la chaussée, et le joueur qui
+// doit choisir son côté. Les deux sont posées en quinconce pour dessiner une
+// chicane sur la longueur de la rue.
+createBin(-3.5, -4.6, 0.12, 'vert');
+createBin(-3.5, -5.45, -0.08, 'jaune');
+createBarrier(-1.4, -6.5, 2.2);
+
+createBin(3.45, -10.2, -0.15, 'vert');   // devant l'épicerie, à sa hauteur
+createBin(3.45, -11.05, 0.06, 'blanc');
+
+createBarrier(1.4, -19, 2.2);
+createBin(1.15, -25, 0.3, 'jaune');       // bac esseulé au milieu de la chaussée
+createBin(-3.45, -31.5, -0.1, 'vert');
+
 
 // ============================================================================
 // 9. LA GALERIE : ACCROCHAGE DES OEUVRES
@@ -816,6 +989,24 @@ function clampToStreet(pos) {
 }
 
 function resolveCollisions(pos) {
+  // Emprises rectangulaires (barrières). On teste contre la boîte élargie du
+  // rayon du joueur et on ressort par le côté le plus proche : le déplacement
+  // le long de la barrière est conservé, on la longe au lieu de s'y coller.
+  for (const b of BLOCKERS) {
+    const r = PLAYER.radius;
+    const minX = b.minX - r;
+    const maxX = b.maxX + r;
+    const minZ = b.minZ - r;
+    const maxZ = b.maxZ + r;
+    if (pos.x <= minX || pos.x >= maxX || pos.z <= minZ || pos.z >= maxZ) continue;
+
+    const out = Math.min(pos.x - minX, maxX - pos.x, pos.z - minZ, maxZ - pos.z);
+    if (out === pos.x - minX) pos.x = minX;
+    else if (out === maxX - pos.x) pos.x = maxX;
+    else if (out === pos.z - minZ) pos.z = minZ;
+    else pos.z = maxZ;
+  }
+
   // Mâts : on repousse radialement, ce qui fait contourner le poteau plutôt que
   // s'y arrêter net. Aucun risque de le franchir d'un bond : à 2,5 m/s et avec
   // un delta plafonné à 0,1 s, un pas fait au plus 25 cm pour un obstacle large
@@ -906,7 +1097,9 @@ function animate() {
     resolveCollisions(camera.position);
     // Après la résolution horizontale : la hauteur du sol dépend du X retenu.
     updateVertical(delta);
-    if (!TOUCH_MODE) updateAim();
+    // Aussi au doigt désormais : le viseur reste caché, mais la visée pilote le
+    // bouton d'ouverture.
+    updateAim();
   }
 
   // Recentré à chaque image, y compris en pause : le joueur ne peut ni sortir du
@@ -1043,6 +1236,9 @@ function updateAim() {
   aimed = target;
   if (target) hudTitle.textContent = target.userData.title;
   hud.classList.toggle('hud--aiming', Boolean(target));
+  // Au doigt, c'est le bouton d'ouverture qui matérialise la visée : pas de
+  // réticule, mais le bouton qui surgit quand une toile est au centre.
+  setActionTarget(target);
 }
 
 // Rectangle occupé à l'écran, en pixels CSS, par la face avant de la toile.
@@ -1235,6 +1431,24 @@ html, body { touch-action: none; overscroll-behavior: none;
 .jump--on { opacity: .42; pointer-events: auto; }
 .jump:active { opacity: .85; }
 
+/* Bouton d'ouverture : n'apparaît que lorsqu'une toile est au centre de l'écran.
+   Il est donc son propre mode d'emploi — rien à expliquer, il surgit quand il
+   sert. Il double la tape directe, qui reste le geste naturel. */
+.act { position: fixed; z-index: 7; left: 50%;
+       bottom: calc(104px + env(safe-area-inset-bottom, 0px));
+       transform: translateX(-50%) translateY(10px);
+       display: flex; align-items: center; gap: 12px;
+       padding: 12px 20px; border-radius: 999px;
+       border: 1px solid rgba(240,217,181,.45);
+       background: rgba(13,10,8,.6); color: #f0d9b5;
+       font: 12px monospace; letter-spacing: .2em; text-transform: uppercase;
+       white-space: nowrap; opacity: 0; pointer-events: none;
+       transition: opacity .2s, transform .2s; }
+.act--on { opacity: .95; pointer-events: auto; transform: translateX(-50%) translateY(0); }
+.act:active { background: rgba(240,217,181,.28); }
+.act b { font-weight: normal; }
+.act span { opacity: .55; }
+
 /* L'aide d'entrée : visible au premier passage, puis effacée. */
 .tip { position: fixed; z-index: 6; left: 0; right: 0;
        bottom: calc(26px + env(safe-area-inset-bottom, 0px));
@@ -1249,6 +1463,7 @@ html, body { touch-action: none; overscroll-behavior: none;
   .stick { width: 92px; height: 92px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); }
   .stick__knob { width: 38px; height: 38px; }
   .jump { width: 62px; height: 62px; bottom: calc(22px + env(safe-area-inset-bottom, 0px)); }
+  .act { bottom: calc(88px + env(safe-area-inset-bottom, 0px)); padding: 9px 16px; }
   .tip { bottom: calc(14px + env(safe-area-inset-bottom, 0px)); }
 }
 `;
@@ -1257,6 +1472,8 @@ let stick = null;
 let knob = null;
 let tip = null;
 let jumpBtn = null;
+let actionBtn = null;
+let actionTitle = null;
 
 function showTouchUI() {
   if (!stick) return;
@@ -1268,7 +1485,16 @@ function hideTouchUI() {
   if (!stick) return;
   stick.classList.remove('stick--on', 'stick--held');
   jumpBtn.classList.remove('jump--on');
+  actionBtn.classList.remove('act--on');
   resetStick();
+}
+
+// Appelé par updateAim (section 13) à chaque changement de cible : le bouton
+// suit ce qui est au centre de l'écran.
+function setActionTarget(mesh) {
+  if (!actionBtn) return;
+  if (mesh) actionTitle.textContent = mesh.userData.title;
+  actionBtn.classList.toggle('act--on', Boolean(mesh) && isPlaying());
 }
 
 function resetStick() {
@@ -1298,6 +1524,20 @@ if (TOUCH_MODE) {
   jumpBtn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     tryJump();
+  });
+
+  actionBtn = document.createElement('button');
+  actionBtn.className = 'act';
+  actionBtn.type = 'button';
+  actionBtn.innerHTML = '<b></b><span>VOIR</span>';
+  document.body.appendChild(actionBtn);
+  actionTitle = actionBtn.querySelector('b');
+
+  // click et non pointerdown : un balayage amorcé sur le bouton puis parti
+  // ailleurs ne doit pas ouvrir la toile. Le click exige l'appui ET le relâché
+  // sur le bouton.
+  actionBtn.addEventListener('click', () => {
+    if (aimed) openViewer(aimed);
   });
 
   tip = document.createElement('div');
@@ -1358,7 +1598,14 @@ if (TOUCH_MODE) {
   let lookId = null;
   let lastX = 0;
   let lastY = 0;
-  let travelled = 0;
+  let downX = 0;
+  let downY = 0;
+
+  // Distance à vol d'oiseau depuis le point d'appui — surtout PAS la longueur du
+  // trajet cumulée. Un doigt posé qui tremble émet des dizaines de pointermove
+  // de 1 ou 2 px : leur somme franchissait le seuil avant même qu'on relâche, et
+  // toutes les tapes étaient prises pour des balayages.
+  const drift = (e) => Math.hypot(e.clientX - downX, e.clientY - downY);
 
   function applyLook(dx, dy) {
     lookEuler.setFromQuaternion(camera.quaternion);
@@ -1375,9 +1622,8 @@ if (TOUCH_MODE) {
     // refermait la toile à peine ouverte.
     e.preventDefault();
     lookId = e.pointerId;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    travelled = 0;
+    downX = lastX = e.clientX;
+    downY = lastY = e.clientY;
     canvas.setPointerCapture(e.pointerId);
   });
 
@@ -1387,17 +1633,16 @@ if (TOUCH_MODE) {
     const dy = e.clientY - lastY;
     lastX = e.clientX;
     lastY = e.clientY;
-    travelled += Math.hypot(dx, dy);
     applyLook(dx, dy);
-    if (travelled > TOUCH.tapSlop) dismissTip();
+    if (drift(e) > TOUCH.tapSlop) dismissTip();
   });
 
   function endLook(e) {
     if (e.pointerId !== lookId) return;
     lookId = null;
-    // Un doigt qui n'a presque pas bougé est une tape, pas un balayage : on
-    // ouvre la toile qui se trouve sous lui.
-    if (travelled < TOUCH.tapSlop) {
+    // Un doigt qui n'a pas dérivé est une tape, pas un balayage : on ouvre la
+    // toile qui se trouve sous lui.
+    if (drift(e) < TOUCH.tapSlop) {
       const mesh = artworkAtClient(e.clientX, e.clientY);
       if (mesh) {
         dismissTip();
