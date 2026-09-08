@@ -33,6 +33,21 @@ const LOOK = {
 
 const EYE_HEIGHT = 1.7;
 
+// Encombrement du joueur, vu de dessus. 0,40 m le tient assez loin des façades
+// pour que la caméra n'entre jamais dans une toile (elle dépasse de 7,5 cm) ni
+// dans la potence d'un spot (25 cm), tout en le laissant s'approcher à ~32 cm
+// d'une oeuvre, de quoi la remplir tout l'écran.
+const PLAYER = { radius: 0.4 };
+
+// Physique verticale. La gravité est plus vive que les 9,81 m/s² réels : c'est
+// l'usage dans les jeux, un saut réel paraît flottant. À 5,2 m/s d'impulsion on
+// s'élève de v²/2g = 0,61 m et on retombe en un peu moins d'une demi-seconde.
+const PHYSICS = {
+  gravity: 22,
+  jumpSpeed: 5.2,
+  stepHeight: 0.35, // marche franchie sans sauter — le trottoir n'en fait que 0,18
+};
+
 // Champ de vision. Le fov de three.js est VERTICAL : tel quel, un téléphone tenu
 // à la verticale (rapport ~0,46) ne montrerait qu'environ 36° d'horizontale, on
 // n'y verrait plus la rue. On élargit donc le vertical en portrait pour récupérer
@@ -45,7 +60,10 @@ const VIEW = {
 
 // Réglages tactiles (section 14).
 const TOUCH = {
-  lookSpeed: 0.0032,  // le pouce parcourt moins de distance qu'une souris
+  // Le doigt parcourt bien moins de distance qu'une souris. À 0,0045 rad/px, un
+  // balayage sur toute la largeur d'un téléphone (~390 px) fait tourner d'une
+  // centaine de degrés ; à 0,0032 il fallait s'y reprendre à deux fois.
+  lookSpeed: 0.0045,
   deadZone: 0.12,     // sous ce seuil le joystick est considéré au repos
   tapSlop: 12,        // px : au-delà, le doigt regardait autour, ce n'est pas une tape
   hintDelay: 5,       // s d'affichage de l'aide au premier passage
@@ -93,12 +111,12 @@ const GALLERY = {
 // Le titre affiché dans la visionneuse est déduit du nom de fichier ; ajouter un
 // champ `title: '...'` sur une ligne pour lui donner un vrai nom à la place.
 const ARTWORKS = [
-  { src: '/assets/tableau/1.png', size: 1.5, side: 'left',  z: -2 },    // bleu roi, très contrasté : la première chose qu'on voit
-  { src: '/assets/tableau/5.png', size: 1.4, side: 'right', z: -5.5 },  // ocre sourd : placé près, sinon le brouillard le mange
-  { src: '/assets/tableau/6.png', size: 1.5, side: 'left',  z: -12 },   // jaune / bleu : relance le regard vers le fond de la rue
-  { src: '/assets/tableau/4.png', size: 1.4, side: 'right', z: -16.5 }, // brun chaud : tient encore à 22 m grâce au panneau sombre
-  { src: '/assets/tableau/2.png', size: 1.4, side: 'left',  z: -20.5 }, // rouille
-  { src: '/assets/tableau/3.png', size: 1.5, side: 'right', z: -29 },   // orange saturé : la seule teinte qui tienne à 34 m
+  { src: '/assets/tableau/Sofia.png', size: 1.5, side: 'left',  z: -2 },    // bleu roi, très contrasté : la première chose qu'on voit
+  { src: '/assets/tableau/Toumani.png', size: 1.4, side: 'right', z: -5.5 },  // ocre sourd : placé près, sinon le brouillard le mange
+  { src: '/assets/tableau/Soheila.png', size: 1.5, side: 'left',  z: -12 },   // jaune / bleu : relance le regard vers le fond de la rue
+  { src: '/assets/tableau/Fanta.png', size: 1.4, side: 'right', z: -16.5 }, // brun chaud : tient encore à 22 m grâce au panneau sombre
+  { src: '/assets/tableau/Zenji.png', size: 1.4, side: 'left',  z: -20.5 }, // rouille
+  { src: '/assets/tableau/Mahere.png', size: 1.5, side: 'right', z: -29 },   // orange saturé : la seule teinte qui tienne à 34 m
 ];
 
 // ============================================================================
@@ -373,6 +391,10 @@ const coneMat = new THREE.MeshBasicMaterial({
   depthWrite: false,
 });
 
+// Les mâts sont les seuls obstacles au milieu de la rue : on les enregistre pour
+// que le joueur les contourne au lieu de les traverser (section 12).
+const OBSTACLES = [];
+
 function createStreetLight(x, z, rotateY) {
   const group = new THREE.Group();
 
@@ -391,6 +413,8 @@ function createStreetLight(x, z, rotateY) {
   group.position.set(x, STREET.curbHeight, z);
   group.rotation.y = rotateY;
   scene.add(group);
+  // 0,10 m : le rayon du mât à sa base (0,08) avec une marge.
+  OBSTACLES.push({ x, z, radius: 0.1 });
 }
 
 // Un lampadaire tous les deux blocs, en alternance d'un trottoir à l'autre,
@@ -558,7 +582,8 @@ manager.onError = (url) => {
 //     Deux façons d'entrer dans la rue : au clavier/souris le verrouillage de
 //     pointeur fait foi ; sur écran tactile il n'existe pas, c'est le drapeau
 //     `entered` qui tient ce rôle. Tout le reste du code interroge isPlaying().
-//     TODO étape suivante : gravité, saut, marche du trottoir, collisions.
+//     Chaque image résout d'abord le déplacement horizontal et ses collisions,
+//     puis la verticale — la hauteur du sol dépend du X finalement retenu.
 // ============================================================================
 const controls = new PointerLockControls(camera, document.body);
 
@@ -610,7 +635,15 @@ document.addEventListener('pointerlockerror', () => {
 });
 
 const keys = { KeyW: false, KeyA: false, KeyS: false, KeyD: false };
-document.addEventListener('keydown', (e) => { if (e.code in keys) keys[e.code] = true; });
+document.addEventListener('keydown', (e) => {
+  if (e.code in keys) keys[e.code] = true;
+  // Espace hors de `keys` : c'est une impulsion, pas un état. Le maintenir
+  // enchaîne les sauts, ce qui est le comportement attendu d'un FPS.
+  if (e.code === 'Space') {
+    e.preventDefault();
+    tryJump();
+  }
+});
 document.addEventListener('keyup', (e) => { if (e.code in keys) keys[e.code] = false; });
 
 const velocity = new THREE.Vector3();
@@ -634,6 +667,95 @@ function readMoveInput(out) {
   return out;
 }
 
+// --- Collisions ------------------------------------------------------------
+// La rue est un couloir fermé : plutôt que de confronter la caméra à chaque mur,
+// on la maintient dans le rectangle délimité par le nu des vitrines et par les
+// deux immeubles de fond. C'est exact, ça se rogne axe par axe — ce qui donne
+// gratuitement le glissement le long d'une façade — et surtout c'est
+// intraversable par construction, là où un test de trajectoire pourrait laisser
+// passer au travers en une image de retard.
+const WALLS = {
+  minX: -(FACADE_X - PLAYER.radius),                          // -4,3
+  maxX: FACADE_X - PLAYER.radius,                             // +4,3
+  minZ: STREET.zStart - STREET.length + PLAYER.radius,        // -49,6 (mur du fond)
+  maxZ: STREET.zStart - PLAYER.radius,                        //  +9,6 (mur derrière le spawn)
+};
+
+function clampToStreet(pos) {
+  pos.x = Math.min(WALLS.maxX, Math.max(WALLS.minX, pos.x));
+  pos.z = Math.min(WALLS.maxZ, Math.max(WALLS.minZ, pos.z));
+}
+
+function resolveCollisions(pos) {
+  // Mâts : on repousse radialement, ce qui fait contourner le poteau plutôt que
+  // s'y arrêter net. Aucun risque de le franchir d'un bond : à 2,5 m/s et avec
+  // un delta plafonné à 0,1 s, un pas fait au plus 25 cm pour un obstacle large
+  // de 1 m une fois le rayon du joueur ajouté.
+  for (const o of OBSTACLES) {
+    const dx = pos.x - o.x;
+    const dz = pos.z - o.z;
+    const reach = o.radius + PLAYER.radius;
+    const dist = Math.hypot(dx, dz);
+    if (dist >= reach) continue;
+    if (dist < 1e-4) {
+      pos.x = o.x + reach; // pile sur l'axe du mât : on sort par la droite
+      continue;
+    }
+    pos.x = o.x + (dx / dist) * reach;
+    pos.z = o.z + (dz / dist) * reach;
+  }
+
+  // Le couloir tranche en dernier : être repoussé par un poteau ne doit jamais
+  // faire sortir des murs.
+  clampToStreet(pos);
+}
+
+// --- Sol, gravité et saut --------------------------------------------------
+// Le sol ne dépend que de X : chaussée au centre, trottoirs surélevés de part et
+// d'autre, et ils courent sur toute la longueur de la rue. Pas besoin de tester
+// quoi que ce soit en Z.
+function groundHeight(x) {
+  return Math.abs(x) >= ROAD_HALF ? STREET.curbHeight : 0;
+}
+
+let grounded = true;
+
+function updateVertical(delta) {
+  const floor = groundHeight(camera.position.x) + EYE_HEIGHT;
+  const wasGrounded = grounded;
+
+  velocity.y -= PHYSICS.gravity * delta;
+  camera.position.y += velocity.y * delta;
+
+  // Marche montante : on enjambe le trottoir sans avoir à sauter. Le pas d'une
+  // image (0,22 m au pire) est plus petit que la marche, donc on ne peut pas
+  // passer sous le sol : on est simplement remonté dessus.
+  if (camera.position.y < floor) {
+    camera.position.y = floor;
+    velocity.y = 0;
+    grounded = true;
+    return;
+  }
+
+  // Marche descendante : qui marchait au sol y reste. Sans ça, chaque descente
+  // de trottoir décollerait le joueur pendant 0,13 s, et faire un aller-retour
+  // sur le bord produirait un sautillement permanent.
+  if (wasGrounded && velocity.y <= 0 && camera.position.y - floor <= PHYSICS.stepHeight) {
+    camera.position.y = floor;
+    velocity.y = 0;
+    grounded = true;
+    return;
+  }
+
+  grounded = false;
+}
+
+function tryJump() {
+  if (!grounded || !isPlaying()) return;
+  velocity.y = PHYSICS.jumpSpeed;
+  grounded = false;
+}
+
 function animate() {
   const time = performance.now();
   // Borné : sans ça, revenir sur l'onglet après 10 s téléporte le joueur.
@@ -652,6 +774,9 @@ function animate() {
 
     controls.moveRight(-velocity.x * delta);
     controls.moveForward(-velocity.z * delta);
+    resolveCollisions(camera.position);
+    // Après la résolution horizontale : la hauteur du sol dépend du X retenu.
+    updateVertical(delta);
     if (!TOUCH_MODE) updateAim();
   }
 
@@ -813,49 +938,77 @@ function screenRect(mesh) {
   return { cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, w: maxX - minX };
 }
 
+// Personne n'attend le résultat de openViewer : une exception y passerait
+// inaperçue et laisserait viewerOpen à vrai, donc le joueur sans commandes,
+// définitivement. D'où le try/catch qui rend toujours la main.
 async function openViewer(mesh) {
   if (viewerOpen) return;
   viewerOpen = true;
 
-  const from = screenRect(mesh);
-  viewerCap.textContent = mesh.userData.title;
-  viewerImg.src = mesh.userData.src;
-
-  // On rend la souris pour pouvoir cliquer dans la visionneuse. Les touches
-  // encore enfoncées sont remises à zéro, sinon on repart en glissade au retour.
-  controls.unlock();
-  hideTouchUI();
-  for (const code of Object.keys(keys)) keys[code] = false;
-  velocity.set(0, 0, 0);
-  hud.classList.remove('hud--aiming');
-  aimed = null;
-
-  viewer.hidden = false;
-  gsap.set(viewerImg, { opacity: 0 });
-  gsap.to(backdrop, { opacity: 0.97, duration: 0.45, ease: 'power2.out' });
-
-  // decode() garantit que l'image a ses dimensions avant qu'on la mesure. Elle
-  // est déjà dans le cache du navigateur, chargée comme texture : c'est immédiat.
   try {
-    await viewerImg.decode();
-  } catch {
-    // Image indisponible : on montre quand même le cadre et le titre.
+    const from = screenRect(mesh);
+    viewerCap.textContent = mesh.userData.title;
+    viewerImg.src = mesh.userData.src;
+
+    // On rend la souris pour pouvoir cliquer dans la visionneuse. Les touches
+    // encore enfoncées sont remises à zéro, sinon on repart en glissade au retour.
+    controls.unlock();
+    hideTouchUI();
+    for (const code of Object.keys(keys)) keys[code] = false;
+    velocity.set(0, 0, 0);
+    hud.classList.remove('hud--aiming');
+    aimed = null;
+
+    viewer.hidden = false;
+    gsap.set(viewerImg, { opacity: 0 });
+    gsap.to(backdrop, { opacity: 0.97, duration: 0.45, ease: 'power2.out' });
+    blockGhostClick();
+
+    // decode() ne sert qu'à connaître les dimensions de l'image avant de
+    // l'animer. Sur mobile il peut ne jamais se résoudre sur un PNG de 3 Mo, et
+    // l'attendre sans limite laissait l'écran noir, sans image et sans
+    // commandes : au bout de 250 ms on continue avec une taille approchée.
+    await Promise.race([
+      viewerImg.decode().catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 250)),
+    ]);
+
+    const to = viewerImg.getBoundingClientRect();
+    openedFrom = to.width
+      ? {
+          x: from.cx - (to.x + to.width / 2),
+          y: from.cy - (to.y + to.height / 2),
+          scale: from.w / to.width,
+        }
+      : { x: 0, y: 0, scale: 0.9 };
+
+    gsap.set(viewerImg, { ...openedFrom, opacity: 1 });
+    gsap.to(viewerImg, { x: 0, y: 0, scale: 1, duration: 0.7, ease: 'power3.out' });
+    gsap.fromTo(
+      [viewerCap, closeBtn],
+      { opacity: 0, y: 10 },
+      { opacity: 1, y: 0, duration: 0.4, delay: 0.3, ease: 'power2.out' }
+    );
+  } catch (err) {
+    console.error('[galerie] ouverture impossible', err);
+    viewer.hidden = true;
+    viewer.style.pointerEvents = '';
+    viewerOpen = false;
+    resumeAfterViewer();
   }
+}
 
-  const to = viewerImg.getBoundingClientRect();
-  openedFrom = {
-    x: from.cx - (to.x + to.width / 2),
-    y: from.cy - (to.y + to.height / 2),
-    scale: to.width ? from.w / to.width : 0.9,
-  };
-
-  gsap.set(viewerImg, { ...openedFrom, opacity: 1 });
-  gsap.to(viewerImg, { x: 0, y: 0, scale: 1, duration: 0.7, ease: 'power3.out' });
-  gsap.fromTo(
-    [viewerCap, closeBtn],
-    { opacity: 0, y: 10 },
-    { opacity: 1, y: 0, duration: 0.4, delay: 0.3, ease: 'power2.out' }
-  );
+// Après une tape, le navigateur émet encore un clic de compatibilité à l'endroit
+// touché. Le voile venant d'apparaître sous le doigt, ce clic fantôme le
+// refermait aussitôt. La visionneuse reste donc insensible le temps qu'il passe.
+let ghostTimer = null;
+function blockGhostClick() {
+  if (!TOUCH_MODE) return;
+  viewer.style.pointerEvents = 'none';
+  clearTimeout(ghostTimer);
+  ghostTimer = setTimeout(() => {
+    viewer.style.pointerEvents = '';
+  }, 400);
 }
 
 function closeViewer() {
@@ -870,6 +1023,8 @@ function closeViewer() {
     ease: 'power3.in',
     onComplete: () => {
       viewer.hidden = true;
+      clearTimeout(ghostTimer);
+      viewer.style.pointerEvents = '';
       gsap.set(viewerImg, { clearProps: 'all' });
       resumeAfterViewer();
     },
@@ -934,6 +1089,19 @@ html, body { touch-action: none; overscroll-behavior: none;
                border: 1px solid rgba(13,10,8,.45);
                will-change: transform; }
 
+.jump { position: fixed; z-index: 6;
+        right: calc(24px + env(safe-area-inset-right, 0px));
+        bottom: calc(36px + env(safe-area-inset-bottom, 0px));
+        width: 76px; height: 76px; border-radius: 50%;
+        border: 1px solid rgba(240,217,181,.4);
+        background: rgba(13,10,8,.25); color: #f0d9b5;
+        font: 15px monospace; letter-spacing: .1em;
+        display: grid; place-items: center;
+        opacity: 0; pointer-events: none;
+        transition: opacity .3s; }
+.jump--on { opacity: .42; pointer-events: auto; }
+.jump:active { opacity: .85; }
+
 /* L'aide d'entrée : visible au premier passage, puis effacée. */
 .tip { position: fixed; z-index: 6; left: 0; right: 0;
        bottom: calc(26px + env(safe-area-inset-bottom, 0px));
@@ -947,6 +1115,7 @@ html, body { touch-action: none; overscroll-behavior: none;
 @media (max-height: 460px) {
   .stick { width: 92px; height: 92px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); }
   .stick__knob { width: 38px; height: 38px; }
+  .jump { width: 62px; height: 62px; bottom: calc(22px + env(safe-area-inset-bottom, 0px)); }
   .tip { bottom: calc(14px + env(safe-area-inset-bottom, 0px)); }
 }
 `;
@@ -954,14 +1123,18 @@ html, body { touch-action: none; overscroll-behavior: none;
 let stick = null;
 let knob = null;
 let tip = null;
+let jumpBtn = null;
 
 function showTouchUI() {
-  if (stick) stick.classList.add('stick--on');
+  if (!stick) return;
+  stick.classList.add('stick--on');
+  jumpBtn.classList.add('jump--on');
 }
 
 function hideTouchUI() {
   if (!stick) return;
   stick.classList.remove('stick--on', 'stick--held');
+  jumpBtn.classList.remove('jump--on');
   resetStick();
 }
 
@@ -980,6 +1153,19 @@ if (TOUCH_MODE) {
   stick.innerHTML = '<i class="stick__knob"></i>';
   document.body.appendChild(stick);
   knob = stick.querySelector('.stick__knob');
+
+  jumpBtn = document.createElement('button');
+  jumpBtn.className = 'jump';
+  jumpBtn.type = 'button';
+  jumpBtn.textContent = 'SAUT';
+  jumpBtn.setAttribute('aria-label', 'Sauter');
+  document.body.appendChild(jumpBtn);
+
+  // pointerdown, pas click : le saut doit partir à l'instant où le doigt touche.
+  jumpBtn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    tryJump();
+  });
 
   tip = document.createElement('div');
   tip.className = 'tip';
@@ -1051,6 +1237,10 @@ if (TOUCH_MODE) {
 
   canvas.addEventListener('pointerdown', (e) => {
     if (!isPlaying() || lookId !== null) return;
+    // Annule les événements souris de compatibilité que le navigateur émettrait
+    // ensuite : c'est la première ligne de défense contre le clic fantôme qui
+    // refermait la toile à peine ouverte.
+    e.preventDefault();
     lookId = e.pointerId;
     lastX = e.clientX;
     lastY = e.clientY;
