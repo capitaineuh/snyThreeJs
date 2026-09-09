@@ -128,6 +128,9 @@ const GALLERY = {
 // 50 cm à 3,50 m de haut, sur toute la longueur de la rue.
 const SCULPTURE = {
   src: '/assets/sculpture_web.glb',
+  title: 'Djibril',
+  // Pas d'image 2D à agrandir : viser la sculpture renvoie droit à sa fiche.
+  url: 'https://www.artsy.net/artwork/seny-djibril-found-the-right-thing',
   height: 1.25,     // hauteur voulue en mètres — un personnage accroupi
   side: 'left',
   z: -9,            // au-dessus de la porte de garage du bloc 2
@@ -699,8 +702,10 @@ const panelMat = new THREE.MeshLambertMaterial({ color: 0x2a2622 });
 const canvasEdgeMat = new THREE.MeshLambertMaterial({ color: 0x1c1a17 });
 const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0xffe6b0 });
 
-// Les toiles seules sont visées par le viseur (section 13).
-const ARTWORK_MESHES = [];
+// Tout ce que le viseur peut désigner (section 13) : les toiles, qui s'ouvrent
+// dans la visionneuse, et la sculpture, qui renvoie à sa fiche en ligne. Ce que
+// fait un clic se lit dans userData : `link` vrai = lien, sinon visionneuse.
+const PICKABLES = [];
 
 // « /assets/tableau/1.png » -> « 1 ». Les tirets et soulignés deviennent des
 // espaces, donc renommer un fichier suffit à retitrer l'oeuvre.
@@ -782,7 +787,7 @@ function hangArtwork(art) {
   const title = art.title ?? titleFromSrc(art.src);
   canvas.userData = { src: art.src, title, size: art.size, url: art.url ?? artsyUrl(title) };
   mount.add(canvas);
-  ARTWORK_MESHES.push(canvas);
+  PICKABLES.push(canvas);
 
   if (GALLERY.lights) addArtLight(mount, art.size);
   return mount;
@@ -840,6 +845,20 @@ function placeSculpture(root) {
     SCULPTURE.z - (box.min.z + box.max.z) / 2    // centré sur le z demandé
   );
   scene.add(root);
+
+  // Le GLB est un arbre de maillages, et le raycaster travaille sans récursion
+  // (section 13) : on inscrit donc chaque maillage. Ils portent tous la même
+  // fiche, peu importe lequel le viseur touche. Object.assign plutôt qu'une
+  // affectation : les `extras` que Blender range dans userData sont conservés.
+  root.traverse((node) => {
+    if (!node.isMesh) return;
+    Object.assign(node.userData, {
+      title: SCULPTURE.title,
+      url: SCULPTURE.url,
+      link: true,
+    });
+    PICKABLES.push(node);
+  });
 }
 
 new GLTFLoader(manager).load(
@@ -1199,16 +1218,23 @@ document.head.appendChild(
   Object.assign(document.createElement('style'), { textContent: VIEWER_CSS })
 );
 
+// Ce que promet le viseur, selon la cible.
+const HINT = {
+  view: '[ CLIC ] AGRANDIR',
+  link: '[ CLIC ] VOIR SUR ARTSY \u2197',
+};
+
 const hud = document.createElement('div');
 hud.className = 'hud';
 hud.innerHTML =
   '<i class="hud__cross"></i>' +
-  '<div class="hud__label"><b></b><span>[ CLIC ] AGRANDIR</span></div>';
+  '<div class="hud__label"><b></b><span></span></div>';
 // Le viseur ne sert qu'à la souris : au doigt on désigne la toile directement,
 // un réticule au centre laisserait croire qu'il faut viser.
 if (TOUCH_MODE) hud.style.display = 'none';
 document.body.appendChild(hud);
 const hudTitle = hud.querySelector('b');
+const hudHint = hud.querySelector('.hud__label span');
 
 const viewer = document.createElement('div');
 viewer.className = 'viewer';
@@ -1240,33 +1266,41 @@ let viewerOpen = false;
 let aimed = null;                             // toile actuellement visée
 let openedFrom = { x: 0, y: 0, scale: 0.9 };  // départ du FLIP, rejoué à l'envers
 
-// La toile sous un point de l'écran, en coordonnées normalisées [-1, 1].
+// L'oeuvre sous un point de l'écran, en coordonnées normalisées [-1, 1].
 // Le viseur du clavier interroge le centre ; une tape sur mobile interroge le
-// doigt. Face avant seulement : le test sur materialIndex évite de viser une
-// oeuvre par l'arrière en traversant un immeuble, ce qui reste possible tant
-// qu'il n'y a pas de collisions.
-function artworkAt(nx, ny) {
+// doigt. intersectObjects trie par distance : c'est donc bien la cible la plus
+// proche qui l'emporte, toile ou sculpture.
+function targetAt(nx, ny) {
   SCREEN_POINT.set(nx, ny);
   raycaster.setFromCamera(SCREEN_POINT, camera);
-  for (const hit of raycaster.intersectObjects(ARTWORK_MESHES, false)) {
+  for (const hit of raycaster.intersectObjects(PICKABLES, false)) {
+    // La sculpture est un volume : on la prend sous n'importe quel angle.
+    if (hit.object.userData.link) return hit.object;
+    // Face avant seulement pour une toile : le test sur materialIndex évite de
+    // viser une oeuvre par l'arrière en traversant un immeuble, ce qui reste
+    // possible tant qu'il n'y a pas de collisions.
     if (hit.face && hit.face.materialIndex === 4) return hit.object;
   }
   return null;
 }
 
 // Depuis un événement pointeur, en pixels CSS.
-function artworkAtClient(clientX, clientY) {
-  return artworkAt(
+function targetAtClient(clientX, clientY) {
+  return targetAt(
     (clientX / window.innerWidth) * 2 - 1,
     -(clientY / window.innerHeight) * 2 + 1
   );
 }
 
 function updateAim() {
-  const target = viewerOpen ? null : artworkAt(0, 0);
+  const target = viewerOpen ? null : targetAt(0, 0);
   if (target === aimed) return;
   aimed = target;
-  if (target) hudTitle.textContent = target.userData.title;
+  if (target) {
+    hudTitle.textContent = target.userData.title;
+    // Le clic ne fait pas la même chose selon la cible : on le dit avant.
+    hudHint.textContent = target.userData.link ? HINT.link : HINT.view;
+  }
   hud.classList.toggle('hud--aiming', Boolean(target));
   // Au doigt, c'est le bouton d'ouverture qui matérialise la visée : pas de
   // réticule, mais le bouton qui surgit quand une toile est au centre.
@@ -1409,6 +1443,23 @@ function resumeAfterViewer() {
   else controls.lock();
 }
 
+// La sculpture n'a pas d'image à agrandir : elle renvoie droit à sa fiche, dans
+// un nouvel onglet. Le verrouillage de la souris est rendu avant d'ouvrir, sinon
+// on revient sur une rue figée sans savoir pourquoi le curseur a disparu ; le
+// voile « CLIQUER POUR REPRENDRE » reparait de lui-même via l'événement unlock.
+function openLink(mesh) {
+  if (controls.isLocked) controls.unlock();
+  window.open(mesh.userData.url, '_blank', 'noopener');
+}
+
+// Un seul geste pour les deux types de cible. Appelé aussi bien par le clic
+// souris que par la tape et le bouton tactiles : window.open reste dans le
+// geste utilisateur, donc aucun bloqueur de fenêtres ne s'y oppose.
+function activate(mesh) {
+  if (mesh.userData.link) openLink(mesh);
+  else openViewer(mesh);
+}
+
 closeBtn.addEventListener('click', closeViewer);
 backdrop.addEventListener('click', closeViewer);
 
@@ -1422,8 +1473,8 @@ document.addEventListener('keydown', (e) => {
 // donc en entrant dans la rue.
 document.addEventListener('click', (e) => {
   if (TOUCH_MODE || !controls.isLocked || viewerOpen || e.button !== 0) return;
-  const mesh = artworkAt(0, 0);
-  if (mesh) openViewer(mesh);
+  const mesh = targetAt(0, 0);
+  if (mesh) activate(mesh);
 });
 
 // ============================================================================
@@ -1514,6 +1565,7 @@ let tip = null;
 let jumpBtn = null;
 let actionBtn = null;
 let actionTitle = null;
+let actionHint = null;
 
 function showTouchUI() {
   if (!stick) return;
@@ -1533,7 +1585,10 @@ function hideTouchUI() {
 // suit ce qui est au centre de l'écran.
 function setActionTarget(mesh) {
   if (!actionBtn) return;
-  if (mesh) actionTitle.textContent = mesh.userData.title;
+  if (mesh) {
+    actionTitle.textContent = mesh.userData.title;
+    actionHint.textContent = mesh.userData.link ? 'ARTSY \u2197' : 'VOIR';
+  }
   actionBtn.classList.toggle('act--on', Boolean(mesh) && isPlaying());
 }
 
@@ -1569,15 +1624,16 @@ if (TOUCH_MODE) {
   actionBtn = document.createElement('button');
   actionBtn.className = 'act';
   actionBtn.type = 'button';
-  actionBtn.innerHTML = '<b></b><span>VOIR</span>';
+  actionBtn.innerHTML = '<b></b><span></span>';
   document.body.appendChild(actionBtn);
   actionTitle = actionBtn.querySelector('b');
+  actionHint = actionBtn.querySelector('span');
 
   // click et non pointerdown : un balayage amorcé sur le bouton puis parti
   // ailleurs ne doit pas ouvrir la toile. Le click exige l'appui ET le relâché
   // sur le bouton.
   actionBtn.addEventListener('click', () => {
-    if (aimed) openViewer(aimed);
+    if (aimed) activate(aimed);
   });
 
   tip = document.createElement('div');
@@ -1683,10 +1739,10 @@ if (TOUCH_MODE) {
     // Un doigt qui n'a pas dérivé est une tape, pas un balayage : on ouvre la
     // toile qui se trouve sous lui.
     if (drift(e) < TOUCH.tapSlop) {
-      const mesh = artworkAtClient(e.clientX, e.clientY);
+      const mesh = targetAtClient(e.clientX, e.clientY);
       if (mesh) {
         dismissTip();
-        openViewer(mesh);
+        activate(mesh);
       }
     }
   }
