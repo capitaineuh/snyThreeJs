@@ -352,6 +352,23 @@ function sidewalkMaterials(topTex) {
 }
 
 // ============================================================================
+//    LES REGISTRES DE LA RUE
+//    Deux listes remplies au fil de la construction, lues bien plus bas par les
+//    sections d'interaction. Elles sont déclarées ici, avant tout ce qui les
+//    remplit : une liste déclarée après le premier push planterait au chargement.
+// ============================================================================
+
+// Ce que le viseur peut désigner (section 13) : les toiles, qui s'ouvrent dans
+// la visionneuse, la sculpture, qui renvoie à sa fiche en ligne, et les bombes,
+// qui se ramassent. Ce que fait un clic se lit dans `userData.kind`.
+const PICKABLES = [];
+
+// Ce qui accepte la peinture (section 13 ter). Les façades, les portes, le sol.
+// Les oeuvres n'y sont PAS, et c'est délibéré : la rue est sale, l'art reste
+// intact. C'est toute la règle du contraste, et elle tient dans cette liste.
+const PAINTABLES = [];
+
+// ============================================================================
 // 5. SOL : CHAUSSÉE + TROTTOIRS SURÉLEVÉS
 //    Chaussée, trottoirs et immeubles couvrent exactement le même intervalle
 //    z = [+10, -50]. (Auparavant ils étaient décalés et laissaient voir le vide.)
@@ -360,12 +377,14 @@ const road = new THREE.Mesh(new THREE.PlaneGeometry(STREET.roadWidth, STREET.len
 road.rotation.x = -Math.PI / 2;
 road.position.z = Z_CENTER;
 scene.add(road);
+PAINTABLES.push(road);
 
 function createSidewalk(xPos, topTex) {
   const geo = new THREE.BoxGeometry(STREET.sidewalkWidth, STREET.curbHeight, STREET.length);
   const mesh = new THREE.Mesh(geo, sidewalkMaterials(topTex));
   mesh.position.set(xPos, STREET.curbHeight / 2, Z_CENTER);
   scene.add(mesh);
+  PAINTABLES.push(mesh);
   return mesh;
 }
 createSidewalk(-SIDEWALK_CX, sidewalkTex);          // gauche : orientation naturelle
@@ -398,6 +417,7 @@ function createBuildingBlock(side, index) {
   );
   shop.position.set(xDir * (FACADE_X + BLOCK.depth / 2), BLOCK.groundHeight / 2, zPos);
   scene.add(shop);
+  PAINTABLES.push(shop); // le mur de vitrine : c'est là que tout se tague
 
   // Étages, légèrement en retrait.
   const upper = new THREE.Mesh(
@@ -413,6 +433,7 @@ function createBuildingBlock(side, index) {
     zPos
   );
   scene.add(upper);
+  PAINTABLES.push(upper);
 
   // Corniche en surplomb.
   const corniceDepth = BLOCK.setback + 0.3;
@@ -444,6 +465,7 @@ function createGarageDoor(xDir, z) {
   // Un PlaneGeometry regarde +Z ; on le tourne pour qu'il regarde la rue.
   door.rotation.y = xDir === -1 ? Math.PI / 2 : -Math.PI / 2;
   scene.add(door);
+  PAINTABLES.push(door);
   garageSpans.push({ xDir, from: z - GARAGE.width / 2, to: z + GARAGE.width / 2 });
 }
 
@@ -521,6 +543,7 @@ function createEndWall(z, towardPositiveZ) {
   );
   wall.position.set(0, height / 2, z + (towardPositiveZ ? BLOCK.depth / 2 : -BLOCK.depth / 2));
   scene.add(wall);
+  PAINTABLES.push(wall);
 }
 createEndWall(STREET.zStart, true);
 createEndWall(STREET.zStart - STREET.length, false);
@@ -627,7 +650,12 @@ function createBin(x, z, rotY, flux) {
   scene.add(group);
 
   OBSTACLES.push({ x, z, radius: BIN.radius });
+  return group;
 }
+
+// Dessus du couvercle, dans le repère du bac : c'est le plan sur lequel se pose
+// ce qu'on laisse traîner sur une poubelle.
+const BIN_LID_TOP = BIN.height + 0.14 + 0.045;
 
 // Barrière Vauban, toujours en travers de la rue : gardée alignée sur les axes,
 // pour que son emprise rectangulaire colle vraiment à ce qu'on voit. Une
@@ -676,8 +704,13 @@ function createBarrier(x, z, length) {
 // dévier, c'est la barrière qui mange la moitié de la chaussée, et le joueur qui
 // doit choisir son côté. Les deux sont posées en quinconce pour dessiner une
 // chicane sur la longueur de la rue.
-createBin(-3.5, -4.6, 0.12, 'vert');
-createBin(-3.5, -5.45, -0.08, 'jaune');
+// Les deux premiers bacs sont retenus : ce sont eux qu'on voit en arrivant,
+// juste après la toile « Sofia », et c'est sur leurs couvercles que sont
+// abandonnées les bombes de peinture (section 8 bis).
+const sofiaBins = [
+  createBin(-3.5, -4.6, 0.12, 'vert'),
+  createBin(-3.5, -5.45, -0.08, 'jaune'),
+];
 createBarrier(-1.4, -6.5, 2.2);
 
 createBin(3.45, -10.2, -0.15, 'vert');   // devant l'épicerie, à sa hauteur
@@ -687,6 +720,166 @@ createBarrier(1.4, -19, 2.2);
 createBin(1.15, -25, 0.3, 'jaune');       // bac esseulé au milieu de la chaussée
 createBin(-3.45, -31.5, -0.1, 'vert');
 
+
+// ============================================================================
+// 8 bis. LES BOMBES DE PEINTURE
+//    Trois bombes abandonnées sur les poubelles du début de rue. Pour l'instant
+//    ce n'est que du décor posé : le ramassage et le tag viendront après, mais
+//    tout ce qu'il faudra pour ça est déjà là — chaque bombe est un Group
+//    autonome, inscrit dans SPRAY_CANS, qui porte sa couleur dans userData.
+//
+//    Fabrication en cinq cylindres à 8 pans. Huit et pas trente-deux : de près
+//    on doit voir les facettes, c'est la même grammaire que le reste de la rue.
+//    Le capuchon et la bande d'étiquette portent la couleur de la peinture —
+//    c'est à ça qu'on reconnaît une bombe de loin, pas à sa forme.
+// ============================================================================
+const SPRAY = {
+  radius: 0.038,     // une bombe réelle fait 32 mm ; on force un peu le trait
+  bodyHeight: 0.15,
+  shoulder: 0.035,   // l'épaulement conique sous le capuchon
+  capHeight: 0.055,
+  sides: 8,
+  // Portée du ramassage. Le viseur porte à 20 m pour les toiles ; ramasser un
+  // objet de 24 cm à cette distance n'aurait aucun sens, on se limite au bras.
+  pickRange: 2.2,
+};
+
+// Hauteur totale, utile pour poser la base pile sur le couvercle.
+SPRAY.height = SPRAY.bodyHeight + SPRAY.shoulder + SPRAY.capHeight;
+
+// Le corps est en métal nu, commun aux trois : seule la peinture change.
+const sprayBodyMat = new THREE.MeshLambertMaterial({ color: 0x54585c });
+const sprayNozzleMat = new THREE.MeshLambertMaterial({ color: 0x2b2b2d });
+
+// La palette. `paint` est la couleur qui sortira de la bombe à l'étape suivante ;
+// `cap` n'est là que pour la lisibilité : un capuchon noir pur sur un couvercle
+// sombre serait invisible, on l'éclaircit sans toucher à la peinture.
+const PAINTS = {
+  noir:  { label: 'NOIR',  paint: 0x141414, cap: 0x2e2e30 },
+  jaune: { label: 'JAUNE', paint: 0xe0b81e, cap: 0xe0b81e },
+  rouge: { label: 'ROUGE', paint: 0xc0261c, cap: 0xc0261c },
+};
+
+// Le nuage de peinture à la sortie de la buse. Il ne suit PAS l'axe de la
+// bombe : sa position et son orientation sont recalculées à chaque image
+// (section 13 ter) pour qu'il parte droit devant, perpendiculairement à la
+// bombe, en convergeant vers le point visé.
+const MIST = {
+  radius: 0.06,
+  length: 0.3,
+  converge: 1.4, // distance du point visé sur l'axe du regard, en mètres
+  opacity: 0.2,
+};
+
+// Les bombes posées dans la rue. Vide tant qu'on n'a pas appelé placeSpray.
+const SPRAY_CANS = [];
+
+// Une bombe, base à y = 0 dans son propre repère : elle se pose donc sur
+// n'importe quelle surface sans qu'on ait à corriger la hauteur.
+function createSprayCan(color) {
+  const { radius: r, sides } = SPRAY;
+  const paintMat = new THREE.MeshLambertMaterial({ color: PAINTS[color].paint });
+  const capMat = new THREE.MeshLambertMaterial({ color: PAINTS[color].cap });
+
+  const can = new THREE.Group();
+  const add = (geo, mat, y) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.y = y;
+    can.add(m);
+    return m;
+  };
+
+  add(new THREE.CylinderGeometry(r, r, SPRAY.bodyHeight, sides), sprayBodyMat, SPRAY.bodyHeight / 2);
+
+  // L'étiquette : un anneau à peine plus large que le corps, donc pas de
+  // z-fighting, et assez haut pour rester visible quand la bombe est vue de
+  // trois quarts au-dessus — c'est l'angle qu'on a en marchant.
+  add(new THREE.CylinderGeometry(r * 1.04, r * 1.04, 0.085, sides), paintMat, 0.085);
+
+  add(
+    new THREE.CylinderGeometry(r * 0.5, r, SPRAY.shoulder, sides),
+    sprayBodyMat,
+    SPRAY.bodyHeight + SPRAY.shoulder / 2
+  );
+
+  add(
+    new THREE.CylinderGeometry(r * 0.74, r * 0.74, SPRAY.capHeight, sides),
+    capMat,
+    SPRAY.bodyHeight + SPRAY.shoulder + SPRAY.capHeight / 2
+  );
+
+  // La buse. Deux centimètres de large : on ne la lit qu'en s'approchant, mais
+  // c'est elle qui fait dire « bombe » plutôt que « canette ».
+  add(new THREE.BoxGeometry(0.022, 0.012, 0.03), sprayNozzleMat, SPRAY.height - 0.014);
+
+  // Le nuage de peinture, à la sortie de la buse. Il fait partie de la bombe et
+  // la suit partout ; il n'est visible que pendant qu'on appuie (section 13 ter).
+  // Pas d'AdditiveBlending ici, contrairement aux cônes des lampadaires : en
+  // additif, du noir ne dépose rien. Une bombe noire cracherait du vide.
+  const mist = new THREE.Mesh(
+    new THREE.ConeGeometry(MIST.radius, MIST.length, SPRAY.sides, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: PAINTS[color].paint,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: false,
+    })
+  );
+  // Ni position ni rotation ici : updateHand les recalcule à chaque image, la
+  // direction du jet ne dépendant pas de l'inclinaison de la bombe.
+  mist.visible = false;
+
+  can.userData = {
+    kind: 'spray',
+    color,
+    paint: PAINTS[color].paint,
+    title: 'BOMBE ' + PAINTS[color].label,
+    // Les maillages pleins, relevés AVANT d'ajouter le nuage : c'est ce que le
+    // viseur teste, et on ne vise pas un nuage.
+    parts: can.children.slice(),
+    mist,
+  };
+  can.add(mist);
+  return can;
+}
+
+// Une bombe posée dans la rue est une cible ; une bombe en main ne l'est plus,
+// sinon elle masquerait le viseur en permanence.
+function setCanPickable(can, on) {
+  for (const part of can.userData.parts) {
+    const i = PICKABLES.indexOf(part);
+    if (on && i === -1) {
+      part.userData = { kind: 'spray', can, title: can.userData.title };
+      PICKABLES.push(part);
+    } else if (!on && i !== -1) {
+      PICKABLES.splice(i, 1);
+    }
+  }
+}
+
+// Pose une bombe sur le couvercle d'un bac. Les coordonnées sont locales au bac
+// (x le long de sa largeur, z de sa profondeur) : la bombe suit donc le léger
+// dévers de la poubelle, au lieu de flotter à côté.
+// Le couvercle mesure 0,76 x 0,64 : au-delà de +/- 0,30 en x et 0,24 en z, la
+// bombe déborde dans le vide.
+function placeSprayOnBin(bin, color, dx, dz, rotY) {
+  const can = createSprayCan(color);
+  can.position.set(dx, BIN_LID_TOP, dz);
+  can.rotation.y = rotY;
+  bin.add(can);
+  setCanPickable(can, true);
+  SPRAY_CANS.push(can);
+  return can;
+}
+
+// L'implantation. Deux bombes sur le premier bac — celui qu'on longe en premier,
+// on ne peut pas les manquer — et la troisième sur le suivant, pour que l'oeil
+// continue vers le fond de la rue plutôt que de s'arrêter au premier tas.
+placeSprayOnBin(sofiaBins[0], 'noir', -0.18, -0.06, 0.5);
+placeSprayOnBin(sofiaBins[0], 'jaune', 0.14, 0.1, -0.9);
+placeSprayOnBin(sofiaBins[1], 'rouge', 0.05, -0.08, 1.8);
 
 // ============================================================================
 // 9. LA GALERIE : ACCROCHAGE DES OEUVRES
@@ -701,11 +894,6 @@ createBin(-3.45, -31.5, -0.1, 'vert');
 const panelMat = new THREE.MeshLambertMaterial({ color: 0x2a2622 });
 const canvasEdgeMat = new THREE.MeshLambertMaterial({ color: 0x1c1a17 });
 const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0xffe6b0 });
-
-// Tout ce que le viseur peut désigner (section 13) : les toiles, qui s'ouvrent
-// dans la visionneuse, et la sculpture, qui renvoie à sa fiche en ligne. Ce que
-// fait un clic se lit dans userData : `link` vrai = lien, sinon visionneuse.
-const PICKABLES = [];
 
 // « /assets/tableau/1.png » -> « 1 ». Les tirets et soulignés deviennent des
 // espaces, donc renommer un fichier suffit à retitrer l'oeuvre.
@@ -785,7 +973,13 @@ function hangArtwork(art) {
   );
   canvas.position.z = GALLERY.panelDepth + 0.002 + GALLERY.canvasDepth / 2;
   const title = art.title ?? titleFromSrc(art.src);
-  canvas.userData = { src: art.src, title, size: art.size, url: art.url ?? artsyUrl(title) };
+  canvas.userData = {
+    kind: 'art',
+    src: art.src,
+    title,
+    size: art.size,
+    url: art.url ?? artsyUrl(title),
+  };
   mount.add(canvas);
   PICKABLES.push(canvas);
 
@@ -853,9 +1047,9 @@ function placeSculpture(root) {
   root.traverse((node) => {
     if (!node.isMesh) return;
     Object.assign(node.userData, {
+      kind: 'link',
       title: SCULPTURE.title,
       url: SCULPTURE.url,
-      link: true,
     });
     PICKABLES.push(node);
   });
@@ -941,6 +1135,7 @@ function enterStreet() {
 
 function pauseStreet() {
   entered = false;
+  stopSpray(); // le bouton relâché hors de la fenêtre ne nous parvient jamais
   hud.style.opacity = '0';
   if (TOUCH_MODE) hideTouchUI();
   showOverlay(TOUCH_MODE ? 'TOUCHER POUR REPRENDRE' : 'CLIQUER POUR REPRENDRE');
@@ -1134,7 +1329,12 @@ function animate() {
     // Aussi au doigt désormais : le viseur reste caché, mais la visée pilote le
     // bouton d'ouverture.
     updateAim();
+    updateSpray(delta);
   }
+
+  // Hors du test isPlaying : la main doit revenir au repos même après une mise
+  // en pause, sinon la bombe se fige au milieu d'une foulée.
+  updateHand(delta);
 
   // Recentré à chaque image, y compris en pause : le joueur ne peut ni sortir du
   // dôme ni s'en approcher, et l'horizon reste exactement à hauteur d'oeil.
@@ -1175,6 +1375,14 @@ const VIEWER_CSS = `
 .hud__label b { display: block; font-weight: normal; font-size: 15px;
                 letter-spacing: .18em; text-transform: uppercase; margin-bottom: 7px; }
 .hud__label span { opacity: .65; }
+/* Bandeau du bas : ce qu'on tient et ce qu'on peut en faire. N'apparaît qu'une
+   fois une bombe en main — le reste du temps le bas de l'écran reste vide. */
+.hud__hand { position: absolute; left: 0; right: 0;
+             bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+             text-align: center; font-size: 11px; letter-spacing: .2em;
+             opacity: 0; transition: opacity .25s; }
+.hud--armed .hud__hand { opacity: .8; }
+.hud__hand i { font-style: normal; opacity: .55; }
 
 .viewer { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; }
 .viewer[hidden] { display: none; }
@@ -1220,21 +1428,24 @@ document.head.appendChild(
 
 // Ce que promet le viseur, selon la cible.
 const HINT = {
-  view: '[ CLIC ] AGRANDIR',
+  art: '[ CLIC ] AGRANDIR',
   link: '[ CLIC ] VOIR SUR ARTSY \u2197',
+  spray: '[ CLIC ] RAMASSER',
 };
 
 const hud = document.createElement('div');
 hud.className = 'hud';
 hud.innerHTML =
   '<i class="hud__cross"></i>' +
-  '<div class="hud__label"><b></b><span></span></div>';
+  '<div class="hud__label"><b></b><span></span></div>' +
+  '<div class="hud__hand"></div>';
 // Le viseur ne sert qu'à la souris : au doigt on désigne la toile directement,
 // un réticule au centre laisserait croire qu'il faut viser.
 if (TOUCH_MODE) hud.style.display = 'none';
 document.body.appendChild(hud);
 const hudTitle = hud.querySelector('b');
 const hudHint = hud.querySelector('.hud__label span');
+const hudHand = hud.querySelector('.hud__hand');
 
 const viewer = document.createElement('div');
 viewer.className = 'viewer';
@@ -1274,8 +1485,15 @@ function targetAt(nx, ny) {
   SCREEN_POINT.set(nx, ny);
   raycaster.setFromCamera(SCREEN_POINT, camera);
   for (const hit of raycaster.intersectObjects(PICKABLES, false)) {
+    const kind = hit.object.userData.kind;
+    // Une bombe hors de portée du bras n'est pas une cible — mais elle ne doit
+    // pas masquer ce qu'il y a derrière pour autant, d'où le `continue`.
+    if (kind === 'spray') {
+      if (hit.distance <= SPRAY.pickRange) return hit.object;
+      continue;
+    }
     // La sculpture est un volume : on la prend sous n'importe quel angle.
-    if (hit.object.userData.link) return hit.object;
+    if (kind === 'link') return hit.object;
     // Face avant seulement pour une toile : le test sur materialIndex évite de
     // viser une oeuvre par l'arrière en traversant un immeuble, ce qui reste
     // possible tant qu'il n'y a pas de collisions.
@@ -1299,7 +1517,7 @@ function updateAim() {
   if (target) {
     hudTitle.textContent = target.userData.title;
     // Le clic ne fait pas la même chose selon la cible : on le dit avant.
-    hudHint.textContent = target.userData.link ? HINT.link : HINT.view;
+    hudHint.textContent = HINT[target.userData.kind] ?? HINT.art;
   }
   hud.classList.toggle('hud--aiming', Boolean(target));
   // Au doigt, c'est le bouton d'ouverture qui matérialise la visée : pas de
@@ -1356,6 +1574,7 @@ async function openViewer(mesh) {
     // qui refermait tout — d'où une visionneuse qui ne s'ouvrait jamais au doigt,
     // ni à la tape ni au bouton, sans le moindre signe à l'écran.
     if (controls.isLocked) controls.unlock();
+    stopSpray();
     hideTouchUI();
     for (const code of Object.keys(keys)) keys[code] = false;
     velocity.set(0, 0, 0);
@@ -1456,7 +1675,9 @@ function openLink(mesh) {
 // souris que par la tape et le bouton tactiles : window.open reste dans le
 // geste utilisateur, donc aucun bloqueur de fenêtres ne s'y oppose.
 function activate(mesh) {
-  if (mesh.userData.link) openLink(mesh);
+  const data = mesh.userData;
+  if (data.kind === 'spray') takeSpray(data.can);
+  else if (data.kind === 'link') openLink(mesh);
   else openViewer(mesh);
 }
 
@@ -1471,11 +1692,372 @@ document.addEventListener('keydown', (e) => {
 // Le clic qui verrouille la souris passe aussi par ici, mais isLocked est encore
 // faux à cet instant — il ne bascule qu'au pointerlockchange. Rien ne s'ouvre
 // donc en entrant dans la rue.
-document.addEventListener('click', (e) => {
+//
+// pointerdown et non click : une bombe se maintient enfoncée. Le même bouton
+// sert aux deux gestes, et c'est la visée qui tranche — s'il y a quelque chose
+// sous le réticule on l'actionne, sinon on peint. Le HUD dit toujours lequel des
+// deux va se produire, donc l'ambiguïté ne se voit jamais.
+document.addEventListener('pointerdown', (e) => {
   if (TOUCH_MODE || !controls.isLocked || viewerOpen || e.button !== 0) return;
   const mesh = targetAt(0, 0);
   if (mesh) activate(mesh);
+  else startSpray();
 });
+
+// Sans filtre sur isLocked : si le bouton est relâché après que le verrou a
+// sauté, il faut quand même couper la peinture.
+document.addEventListener('pointerup', (e) => {
+  if (!TOUCH_MODE && e.button === 0) stopSpray();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyG' && isPlaying()) dropSpray();
+});
+
+// ============================================================================
+// 13 ter. LES BOMBES EN MAIN
+//     Trois choses ici : tenir la bombe devant l'oeil, la faire vivre au rythme
+//     de la marche, et déposer de la peinture sur ce qu'on vise.
+//
+//     La peinture est volontairement éphémère : rien n'est sauvegardé, tout
+//     repart à zéro au rechargement. Les taches les plus anciennes s'effacent
+//     d'elles-mêmes au-delà de PAINT.max, ce qui borne la scène quoi qu'il
+//     arrive — on peut tenir le bouton une minute sans faire fondre l'image.
+// ============================================================================
+
+// La caméra n'était pas dans le graphe : PointerLockControls la manipule sans
+// jamais l'y mettre. Or ce qu'on tient en main est un enfant de la caméra —
+// c'est ce qui lui donne gratuitement sa fixité à l'écran quand on tourne la
+// tête. Sans cette ligne, la bombe en main ne serait tout simplement pas rendue.
+scene.add(camera);
+
+// Les deux poses de la bombe, dans le repère de la caméra. Le z négatif est
+// devant l'oeil, le y négatif en dessous : la bombe est donc en bas à droite,
+// coupée par le bord de l'écran comme dans n'importe quel jeu à la première
+// personne. Ce débord est voulu — une arme entièrement visible flotte.
+const HAND = {
+  idlePos: new THREE.Vector3(0.3, -0.33, -0.45),
+  idleRot: new THREE.Euler(-0.05, 0.5, 0.22),
+  // En action, la bombe se redresse vers le centre et bascule la buse vers le
+  // mur. Un rotation.x négatif couche le haut de la bombe vers l'avant.
+  sprayPos: new THREE.Vector3(0.22, -0.26, -0.42),
+  // Presque droite : le jet partant maintenant de côté, une bombe couchée vers
+  // l'avant donnerait un angle bâtard entre les deux.
+  sprayRot: new THREE.Euler(-0.12, 0.34, 0.14),
+  ease: 12, // vitesse de bascule entre les deux poses
+};
+
+// Le balancement de marche. Une foulée = un aller-retour complet de la main ;
+// le petit creux vertical bat deux fois plus vite, une fois par pied posé.
+// C'est ce rapport de fréquences qui fait lire le mouvement comme une marche
+// plutôt que comme un balancier d'horloge.
+const BOB = {
+  rate: 2.8,      // radians de cycle par mètre parcouru, pas par seconde : la
+                  // cadence suit donc la vitesse réelle, y compris au joystick
+  forward: 0.022, // l'avant / arrière — le mouvement principal
+  vertical: 0.012,
+  roll: 0.035,
+  ease: 7,        // montée et descente en douceur de l'amplitude
+};
+
+const PAINT = {
+  range: 3.2,      // au-delà, la peinture se disperse : rien ne se dépose
+  interval: 0.034, // une giclée toutes les 34 ms tant qu'on appuie, soit 29/s
+  size: 0.2,       // largeur de la tache à bout portant
+  spread: 0.16,    // élargissement par mètre : le cône s'ouvre avec la distance
+  scatter: 0.016,  // dispersion angulaire autour du réticule, en NDC
+  // Décollement de la surface peinte. 2 cm, soit un poil plus que le panneau de
+  // fond d'une toile (1,2 cm) : la peinture peut donc mordre sur la bordure
+  // sombre d'un accrochage sans clignoter contre elle. L'oeuvre elle-même, qui
+  // dépasse de 7,4 cm, reste hors d'atteinte — elle occulte la tache.
+  lift: 0.02,
+  max: 400,        // au-delà, les plus vieilles taches disparaissent
+};
+
+let held = null;      // le Group de la bombe tenue, enfant de la caméra
+let spraying = false;
+let sprayClock = 0;
+let bobPhase = 0;
+let bobAmp = 0;
+let posePhase = 0;    // 0 = au repos, 1 = en train de peindre
+
+// --- Prendre et lâcher -------------------------------------------------------
+function takeSpray(can) {
+  if (held === can) return;
+  if (held) dropSpray();
+
+  setCanPickable(can, false);
+  camera.add(can); // add() la retire au passage de la poubelle
+  can.position.copy(HAND.idlePos);
+  can.rotation.copy(HAND.idleRot);
+  held = can;
+  // Remises à zéro : la main démarre au repos et sans élan, quel que soit
+  // l'état dans lequel la bombe précédente a été lâchée.
+  bobPhase = 0;
+  bobAmp = 0;
+  posePhase = 0;
+  refreshHand();
+}
+
+const dropDir = new THREE.Vector3();
+
+function dropSpray() {
+  if (!held) return;
+  stopSpray();
+  const can = held;
+  held = null;
+  // updateHand ne s'occupe plus d'elle : sans ça, une bombe lâchée en pleine
+  // action garderait son nuage de peinture figé au-dessus de la buse.
+  can.userData.mist.visible = false;
+
+  // Reposée un demi-pas devant soi, et pas entre ses pieds : à 1,70 m d'oeil,
+  // ce qui est posé sous soi est hors du champ et passe pour perdu. Le sol est
+  // relu au point d'arrivée, la bombe se pose donc sur le trottoir ou sur la
+  // chaussée selon l'endroit, sans jamais flotter.
+  camera.getWorldDirection(dropDir);
+  dropDir.y = 0;
+  if (dropDir.lengthSq() < 1e-6) dropDir.set(0, 0, -1);
+  dropDir.normalize().multiplyScalar(0.7);
+
+  const x = Math.min(WALLS.maxX, Math.max(WALLS.minX, camera.position.x + dropDir.x));
+  const z = Math.min(WALLS.maxZ, Math.max(WALLS.minZ, camera.position.z + dropDir.z));
+
+  scene.add(can);
+  can.position.set(x, groundHeight(x), z);
+  can.rotation.set(0, Math.random() * Math.PI * 2, 0);
+  setCanPickable(can, true);
+  refreshHand();
+}
+
+function refreshHand() {
+  hud.classList.toggle('hud--armed', Boolean(held));
+  if (held) {
+    hudHand.innerHTML =
+      held.userData.title + ' <i>&middot; [ CLIC ] TAGUER &middot; [ G ] L\u00c2CHER</i>';
+  }
+  if (tagBtn) tagBtn.classList.toggle('jump--on', Boolean(held) && isPlaying());
+}
+
+// --- La main : pose, balancement, nuage --------------------------------------
+// Vecteurs de travail, alloués une fois : updateHand tourne 60 fois par seconde,
+// y allouer quoi que ce soit donnerait au ramasse-miettes de quoi hoqueter.
+const MIST_UP = new THREE.Vector3(0, 1, 0);
+const mistNozzle = new THREE.Vector3();
+const mistDir = new THREE.Vector3();
+const mistBack = new THREE.Vector3();
+const canInv = new THREE.Quaternion();
+
+function updateHand(delta) {
+  if (!held) return;
+
+  // La vitesse est celle du repère de la caméra, la même que celle qui pilote
+  // le déplacement : la main est donc toujours en phase avec les jambes.
+  const speed = Math.hypot(velocity.x, velocity.z);
+  const walking = isPlaying() && grounded && speed > 0.35;
+  bobAmp += ((walking ? Math.min(speed / 2.5, 1) : 0) - bobAmp) * Math.min(1, delta * BOB.ease);
+  bobPhase += speed * BOB.rate * delta;
+  posePhase += ((spraying ? 1 : 0) - posePhase) * Math.min(1, delta * HAND.ease);
+
+  const sway = Math.sin(bobPhase) * bobAmp;
+  const step = Math.sin(bobPhase * 2) * bobAmp;
+  const lerp = THREE.MathUtils.lerp;
+
+  held.position.set(
+    lerp(HAND.idlePos.x, HAND.sprayPos.x, posePhase),
+    lerp(HAND.idlePos.y, HAND.sprayPos.y, posePhase) + step * BOB.vertical,
+    lerp(HAND.idlePos.z, HAND.sprayPos.z, posePhase) + sway * BOB.forward
+  );
+  held.rotation.set(
+    lerp(HAND.idleRot.x, HAND.sprayRot.x, posePhase),
+    lerp(HAND.idleRot.y, HAND.sprayRot.y, posePhase),
+    lerp(HAND.idleRot.z, HAND.sprayRot.z, posePhase) + sway * BOB.roll
+  );
+
+  // Le nuage enfle quand la bombe se lève et disparaît avec elle. Le battement
+  // rapide évite le jet parfaitement lisse, qui trahirait tout de suite le cône
+  // de géométrie.
+  const mist = held.userData.mist;
+  mist.visible = posePhase > 0.02;
+  if (!mist.visible) return;
+  mist.material.opacity = posePhase * (MIST.opacity + 0.05 * Math.sin(performance.now() / 40));
+
+  // --- Direction du jet ---
+  // Le nuage est un enfant de la bombe, donc il hériterait de son inclinaison et
+  // cracherait vers le ciel. On le contre-oriente : on calcule « devant » dans
+  // le repère de la caméra, puis on le repasse dans celui de la bombe.
+  //
+  // La cible n'est pas l'infini mais un point de l'axe du regard à 1,40 m : le
+  // jet converge donc vers le réticule, là où la peinture se dépose vraiment,
+  // au lieu de filer parallèlement à côté. Comme la bombe est tenue presque
+  // droite, le jet en sort perpendiculairement.
+  mistNozzle.set(0, SPRAY.height, 0).applyQuaternion(held.quaternion).add(held.position);
+  mistDir.set(0, 0, -MIST.converge).sub(mistNozzle).normalize();
+  mistDir.applyQuaternion(canInv.copy(held.quaternion).invert());
+
+  // Un ConeGeometry a sa pointe en +Y : pour que celle-ci se plante dans la buse
+  // et que le nuage s'évase vers l'avant, c'est l'INVERSE du jet qu'il faut
+  // aligner sur +Y. Le cône est ensuite avancé d'une demi-longueur, sa position
+  // étant celle de son milieu.
+  mistBack.copy(mistDir).negate();
+  mist.quaternion.setFromUnitVectors(MIST_UP, mistBack);
+  mist.position.set(0, SPRAY.height, 0).addScaledVector(mistDir, MIST.length / 2);
+}
+
+
+// --- La peinture -------------------------------------------------------------
+// Les taches sont des quads plaqués sur la surface visée. Pas de DecalGeometry :
+// la rue n'est faite que de boîtes et de plans, un quad orienté par la normale
+// épouse donc exactement le mur, pour une fraction du coût.
+
+// Générateur déterministe : les mêmes taches à chaque rechargement. C'est la
+// règle suivie partout ailleurs dans la rue (décalages UV, teintes de façade).
+function mulberry32(seed) {
+  return function () {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Une empreinte de bombe : un nuage de points, dense au centre, clairsemé sur
+// les bords, plus quelques projections isolées. 64 px et NearestFilter : la
+// tache doit avoir le même grain que le mur qu'elle recouvre, sinon elle
+// trahirait le rendu 480p en étant plus nette que lui.
+function makeSplatTexture(seed) {
+  const S = 64;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  const rand = mulberry32(seed);
+  g.fillStyle = '#fff';
+
+  for (let i = 0; i < 1500; i++) {
+    // r = u^1.6 concentre fortement les tirages vers le centre : c'est la
+    // signature d'une bombe, un coeur saturé et une frange qui s'effiloche.
+    const a = rand() * Math.PI * 2;
+    const r = Math.pow(rand(), 1.6) * (S / 2 - 1);
+    g.globalAlpha = 0.12 + rand() * 0.33;
+    g.fillRect(
+      Math.floor(S / 2 + Math.cos(a) * r),
+      Math.floor(S / 2 + Math.sin(a) * r),
+      rand() < 0.85 ? 1 : 2,
+      rand() < 0.85 ? 1 : 2
+    );
+  }
+  // Les gouttes perdues, jusqu'au bord : c'est ce qui empêche la tache de
+  // ressembler à un disque flou.
+  for (let i = 0; i < 40; i++) {
+    const a = rand() * Math.PI * 2;
+    const r = (0.55 + rand() * 0.45) * (S / 2 - 1);
+    g.globalAlpha = 0.15 + rand() * 0.35;
+    g.fillRect(Math.floor(S / 2 + Math.cos(a) * r), Math.floor(S / 2 + Math.sin(a) * r), 1, 1);
+  }
+
+  const tex = new THREE.CanvasTexture(cv);
+  // Nearest en agrandissement : de près, la tache doit avoir le même gros grain
+  // que le mur. Mipmaps en réduction, en revanche : sans elles une tache vue de
+  // loin scintillerait à chaque pas, ce que le rendu 432p amplifierait.
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestMipmapLinearFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+const SPLAT_TEXTURES = [makeSplatTexture(7), makeSplatTexture(31), makeSplatTexture(104), makeSplatTexture(920)];
+
+// Un matériau par couple couleur/empreinte, créé au premier usage : douze au
+// maximum pour toute la partie, quel que soit le nombre de taches posées.
+const splatMats = new Map();
+
+function splatMaterial(color, i) {
+  const key = color + i;
+  let mat = splatMats.get(key);
+  if (!mat) {
+    mat = new THREE.MeshLambertMaterial({
+      map: SPLAT_TEXTURES[i],
+      color: PAINTS[color].paint,
+      transparent: true,
+      // Lambert et non Basic : la peinture prend la lumière du mur qu'elle
+      // recouvre, sinon un tag posé dans l'ombre brillerait comme une enseigne.
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+    });
+    splatMats.set(key, mat);
+  }
+  return mat;
+}
+
+const splatGeo = new THREE.PlaneGeometry(1, 1);
+const splats = [];
+const paintRay = new THREE.Raycaster();
+paintRay.far = PAINT.range;
+const paintPoint = new THREE.Vector2();
+const paintNormal = new THREE.Vector3();
+const paintLook = new THREE.Vector3();
+const paintMat3 = new THREE.Matrix3();
+
+function paintOnce() {
+  // La giclée part du réticule, pas de la buse : c'est ce qu'on vise qui se
+  // peint. Un léger éparpillement autour du centre suffit à donner au trait sa
+  // largeur et son irrégularité, sans avoir à simuler quoi que ce soit.
+  paintPoint.set(
+    (Math.random() - 0.5) * 2 * PAINT.scatter,
+    (Math.random() - 0.5) * 2 * PAINT.scatter
+  );
+  paintRay.setFromCamera(paintPoint, camera);
+
+  const hit = paintRay.intersectObjects(PAINTABLES, false)[0];
+  if (!hit || !hit.face) return;
+
+  // face.normal est dans le repère local de l'objet : sans la matrice normale,
+  // une tache posée sur une façade de droite regarderait le mauvais côté et
+  // disparaîtrait dans le mur.
+  paintNormal
+    .copy(hit.face.normal)
+    .applyMatrix3(paintMat3.getNormalMatrix(hit.object.matrixWorld))
+    .normalize();
+
+  const i = (Math.random() * SPLAT_TEXTURES.length) | 0;
+  const splat = new THREE.Mesh(splatGeo, splatMaterial(held.userData.color, i));
+
+  // Le cône s'ouvre avec la distance : collé au mur on trace un trait fin, à
+  // trois mètres on couvre large et clair. C'est le geste réel.
+  const size = (PAINT.size + hit.distance * PAINT.spread) * (0.8 + Math.random() * 0.5);
+  splat.scale.set(size, size, 1);
+  // Décollement légèrement variable : deux taches strictement coplanaires
+  // clignoteraient l'une sur l'autre.
+  splat.position.copy(hit.point).addScaledVector(paintNormal, PAINT.lift + Math.random() * 0.006);
+  splat.lookAt(paintLook.copy(splat.position).add(paintNormal));
+  splat.rotateZ(Math.random() * Math.PI * 2);
+  scene.add(splat);
+
+  // Le tampon circulaire : la géométrie et les matériaux étant partagés, une
+  // tache retirée ne laisse rien derrière elle, il n'y a rien à disposer.
+  splats.push(splat);
+  if (splats.length > PAINT.max) scene.remove(splats.shift());
+}
+
+function startSpray() {
+  if (held && isPlaying()) spraying = true;
+}
+
+function stopSpray() {
+  spraying = false;
+}
+
+function updateSpray(delta) {
+  if (!spraying || !held) return;
+  sprayClock += delta;
+  // Cadence fixe, indépendante du nombre d'images par seconde : le trait a la
+  // même densité sur une machine à 30 fps et sur une machine à 144.
+  while (sprayClock >= PAINT.interval) {
+    sprayClock -= PAINT.interval;
+    paintOnce();
+  }
+}
 
 // ============================================================================
 // 14. COMMANDES TACTILES
@@ -1522,6 +2104,11 @@ html, body { touch-action: none; overscroll-behavior: none;
 .jump--on { opacity: .42; pointer-events: auto; }
 .jump:active { opacity: .85; }
 
+/* Le bouton de peinture, au-dessus du saut : même gabarit, il n'apparaît que
+   lorsqu'on tient une bombe. */
+.tag { bottom: calc(126px + env(safe-area-inset-bottom, 0px));
+       border-color: rgba(240,217,181,.55); }
+
 /* Bouton d'ouverture : n'apparaît que lorsqu'une toile est au centre de l'écran.
    Il est donc son propre mode d'emploi — rien à expliquer, il surgit quand il
    sert. Il double la tape directe, qui reste le geste naturel. */
@@ -1554,6 +2141,8 @@ html, body { touch-action: none; overscroll-behavior: none;
   .stick { width: 92px; height: 92px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); }
   .stick__knob { width: 38px; height: 38px; }
   .jump { width: 62px; height: 62px; bottom: calc(22px + env(safe-area-inset-bottom, 0px)); }
+  /* Repris après .jump, qui vient de réécrire le bas des deux boutons. */
+  .tag { bottom: calc(96px + env(safe-area-inset-bottom, 0px)); }
   .act { bottom: calc(88px + env(safe-area-inset-bottom, 0px)); padding: 9px 16px; }
   .tip { bottom: calc(14px + env(safe-area-inset-bottom, 0px)); }
 }
@@ -1566,11 +2155,13 @@ let jumpBtn = null;
 let actionBtn = null;
 let actionTitle = null;
 let actionHint = null;
+let tagBtn = null;
 
 function showTouchUI() {
   if (!stick) return;
   stick.classList.add('stick--on');
   jumpBtn.classList.add('jump--on');
+  if (held) tagBtn.classList.add('jump--on');
 }
 
 function hideTouchUI() {
@@ -1578,6 +2169,7 @@ function hideTouchUI() {
   stick.classList.remove('stick--on', 'stick--held');
   jumpBtn.classList.remove('jump--on');
   actionBtn.classList.remove('act--on');
+  tagBtn.classList.remove('jump--on');
   resetStick();
 }
 
@@ -1635,6 +2227,24 @@ if (TOUCH_MODE) {
   actionBtn.addEventListener('click', () => {
     if (aimed) activate(aimed);
   });
+
+  // pointerdown / pointerup et non click : une bombe se maintient enfoncée,
+  // exactement comme au bouton de la souris.
+  tagBtn = document.createElement('button');
+  tagBtn.className = 'jump tag';
+  tagBtn.type = 'button';
+  tagBtn.textContent = 'TAG';
+  tagBtn.setAttribute('aria-label', 'Taguer');
+  document.body.appendChild(tagBtn);
+
+  tagBtn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    startSpray();
+  });
+  const releaseTag = () => stopSpray();
+  tagBtn.addEventListener('pointerup', releaseTag);
+  tagBtn.addEventListener('pointercancel', releaseTag);
+  tagBtn.addEventListener('pointerleave', releaseTag);
 
   tip = document.createElement('div');
   tip.className = 'tip';
